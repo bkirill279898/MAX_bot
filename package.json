@@ -1,5 +1,16 @@
 {
+  "name": "maxhub-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "MaxHub Bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+
   "dependencies": {
-    "dotenv": "^17.3.1"
+    "dotenv": "^17.3.1",
+    "@maxhub/max-bot-api": "^1.0.0"
   }
 }
