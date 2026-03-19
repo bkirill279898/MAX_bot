@@ -760,7 +760,7 @@ bot.action("tomorrow", async (ctx) => {
   });
 });
 
-// Проживающие сегодня
+// Проживающе сегодня
 bot.action("residents_today", async (ctx) => {
   const dateStr = formatDateISO(new Date());
   const text = await getResidents(dateStr);
