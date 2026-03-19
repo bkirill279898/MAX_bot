@@ -8,10 +8,12 @@ WORKDIR /app
 COPY package*.json ./
 
 # Устанавливаем зависимости
-# Используем ci для более быстрой и надежной установки в production
-RUN npm install --save @maxhub/max-bot-api
-RUN npm install --save dotenv
-RUN npm ci --only=production
+# Если есть package-lock.json используем ci, иначе install
+RUN if [ -f package-lock.json ]; then \
+      npm ci --omit=dev; \
+    else \
+      npm install --omit=dev; \
+    fi
 
 # Копируем остальные файлы приложения
 COPY . .
