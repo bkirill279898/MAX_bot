@@ -9,6 +9,8 @@ COPY package*.json ./
 
 # Устанавливаем зависимости
 # Используем ci для более быстрой и надежной установки в production
+RUN npm install --save @maxhub/max-bot-api
+RUN npm install --save dotenv
 RUN npm ci --only=production
 
 # Копируем остальные файлы приложения
