@@ -870,11 +870,10 @@ bot.action("reset_progress", async (ctx) => {
 
 // Назад в главное меню
 bot.action("back", async (ctx) => {
-  await replyAndDeletePrevious(ctx, "Главное меню:", {
+  await replyAndDeletePrevious(ctx, "Главное меню111:", {
     attachments: [mainKeyboard]
   });
 });
 
 // ---------- Запуск ----------
-
 bot.start();
