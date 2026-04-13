@@ -1738,9 +1738,9 @@ async function getCashSchedule(monthOffset = 0) {
 
   text += `\n📊 Итого за месяц:\n`;
   text += `Платежей: ${payments.length}\n`;
-  text += `Сумма броней: ${totalAmount.toFixed(0)} ₽\n`;
-  text += `Комиссия: ${totalCommission.toFixed(0)} ₽\n`;
-  text += `К получению: ${totalToReceive.toFixed(0)} ₽`;
+  text += `*Сумма броней: ${totalAmount.toFixed(0)} ₽\n*`;
+  text += `*Комиссия: ${totalCommission.toFixed(0)} ₽\n*`;
+  text += `**К получению: ${totalToReceive.toFixed(0)} ₽**`;
 
   return {
     text,
