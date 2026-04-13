@@ -1096,7 +1096,7 @@ function calculatePaymentDate(channel, checkinDate, checkoutDate) {
   if (rule === "17th_after_checkout") {
     // 17-е число следующего месяца после выезда
     const nextMonth = new Date(checkoutDateObj);
-    nextMonth.setMonth(nextMonth.getMonth() + 1);
+    nextMonth.setMonth(nextMonth.getMonth() + 0);
     nextMonth.setDate(17);
     return nextMonth;
   }
