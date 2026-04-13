@@ -1093,13 +1093,13 @@ function calculatePaymentDate(channel, checkinDate, checkoutDate) {
   const rule = config.special_date_rule;
   const checkoutDateObj = new Date(checkoutDate);
 
-  if (rule === "17th_after_checkout") {
-    // 17-е число следующего месяца после выезда
-    const nextMonth = new Date(checkoutDateObj);
-    nextMonth.setMonth(nextMonth.getMonth() + 0);
-    nextMonth.setDate(17);
-    return nextMonth;
-  }
+    if (rule === "17th_after_checkout") {
+      const payout = new Date(checkoutDateObj);
+      payout.setDate(1); // важно, чтобы не было багов с концом месяца
+      payout.setMonth(payout.getMonth() + 1);
+      payout.setDate(17);
+      return payout;
+    }
 
   if (rule === "25th_after_checkout") {
     // 25-е число следующего месяца после выезда
