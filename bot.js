@@ -677,7 +677,7 @@ function getCleaningKeyboard() {
   return Keyboard.inlineKeyboard([
     [Keyboard.button.callback(todayLabel, "today")],
     [Keyboard.button.callback(tomorrowLabel, "tomorrow")],
-    [Keyboard.button.callback("📅 Календарь", "calendar:0")],
+    [Keyboard.button.callback("📅 kkkkКалендарь", "calendar:0")],
     [Keyboard.button.callback("📊 Статистика на неделю", "week_stats")],
     [Keyboard.button.callback("🏡 Проживающие сегодня", "residents_today")],
     [Keyboard.button.callback("⬅ Назад", "back")]
@@ -870,7 +870,7 @@ bot.action("reset_progress", async (ctx) => {
 
 // Назад в главное меню
 bot.action("back", async (ctx) => {
-  await replyAndDeletePrevious(ctx, "Главное меню111:", {
+  await replyAndDeletePrevious(ctx, "Главное меню:", {
     attachments: [mainKeyboard]
   });
 });
