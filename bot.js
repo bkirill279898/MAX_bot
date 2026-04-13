@@ -1101,21 +1101,21 @@ function calculatePaymentDate(channel, checkinDate, checkoutDate) {
       return payout;
     }
 
-  if (rule === "25th_after_checkout") {
-    // 25-е число следующего месяца после выезда
-    const nextMonth = new Date(checkoutDateObj);
-    nextMonth.setMonth(nextMonth.getMonth() + 1);
-    nextMonth.setDate(25);
-    return nextMonth;
-  }
+      if (rule === "25th_after_checkout") {
+      const payout = new Date(checkoutDateObj);
+      payout.setDate(1); // защита от переполнения месяца
+      payout.setMonth(payout.getMonth() + 1);
+      payout.setDate(25);
+      return payout;
+    }
 
-  if (rule === "15th_after_checkout") {
-    // 15-е число следующего месяца после выезда
-    const nextMonth = new Date(checkoutDateObj);
-    nextMonth.setMonth(nextMonth.getMonth() + 1);
-    nextMonth.setDate(15);
-    return nextMonth;
-  }
+    if (rule === "15th_after_checkout") {
+      const payout = new Date(checkoutDateObj);
+      payout.setDate(1); // защита от переполнения месяца
+      payout.setMonth(payout.getMonth() + 1);
+      payout.setDate(15);
+      return payout;
+    }
 
   if (rule === "checkin_date") {
     return new Date(checkinDate);
