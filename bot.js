@@ -1052,11 +1052,35 @@ const CHANNEL_CONFIG = {
     special_date_rule: "17th_after_checkout",
     note: "✓ уточняется способ оплаты, автоплатеж с 5-15 число"
   },
+  "ТВИЛ": {
+    commission_rate: 0.20,
+    days_offset: 0,
+    special_date_rule: "checkin_date",
+    note: "✓ комиссия аванс на сайте, остальное наличными"
+  },
+  "Прямое": {
+    commission_rate: 0.15,
+    days_offset: 0,
+    special_date_rule: "checkin_date",
+    note: "✓ аванс+оплата"
+  },
+  "Модуль бронирования": {
+    commission_rate: 0.15,
+    days_offset: 0,
+    special_date_rule: "checkin_date",
+    note: "✓ аванс+оплата"
+  },
   "Otello": {
     commission_rate: 0.15,
     days_offset: 5,
     special_date_rule: null,
     note: "✓ автоплатеж через 2-5 дней после брони"
+  },
+  "101hotels.com": {
+    commission_rate: 0.15,
+    days_offset: 0,
+    special_date_rule: "17th_after_checkout",
+    note: "присылают после взаимозачета с 1-15 число"
   },
   "Островок!": {
     commission_rate: 0.15,
@@ -1064,11 +1088,29 @@ const CHANNEL_CONFIG = {
     special_date_rule: "25th_after_checkout",
     note: "✓ автоплатеж 25 числа"
   },
+  "Mirturbaz": {
+    commission_rate: 0.15,
+    days_offset: 0,
+    special_date_rule: "25th_after_checkout",
+    note: "✓ автоплатеж уточняется дата оплаты"
+  },
   "OneTwoTrip!": {
     commission_rate: 0.20,
     days_offset: 0,
     special_date_rule: "15th_after_checkout",
     note: "✓ автоплатеж с 5-15 число"
+  },
+  "Суточно.ру": {
+    commission_rate: 0.20,
+    days_offset: 0,
+    special_date_rule: "checkin_date",
+    note: "✓ аванс на сайте+наличными"
+  },
+  "Avito": {
+    commission_rate: 0.20,
+    days_offset: 0,
+    special_date_rule: "checkin_date",
+    note: "✓ комиссия аванс на сайте, остальное наличными"
   }
 };
 
