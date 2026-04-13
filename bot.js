@@ -1740,7 +1740,7 @@ async function getCashSchedule(monthOffset = 0) {
   text += `Платежей: ${payments.length}\n`;
   text += `Сумма броней: ${totalAmount.toFixed(0)} ₽\n`;
   text += `Комиссия: ${totalCommission.toFixed(0)} ₽\n`;
-  text += `<b>**К получению: ${totalToReceive.toFixed(0)} ₽</b>`;
+  text += `**К получению: ${totalToReceive.toFixed(0)} ₽`;
 
   return {
     text,
