@@ -2162,7 +2162,7 @@ async function getCashSchedule(monthOffset = 0) {
     for (const payment of datePayments) {
       const shortRoom = shortenRoomName(payment.roomName);
       const shortChannel = payment.channel
-        .replace('Яндекс Путешествия (новая версия)', 'Яндекс П')
+        .replace('Яндекс Путешествия (новая версия)', 'ЯндексП')
         .replace('Roomlink (ранее — Забронируй.ру)', 'Roomlink')
         .replace('OneTwoTrip!', '12T')
         .replace('Островок!', 'Островок')
@@ -2188,7 +2188,7 @@ async function getCashSchedule(monthOffset = 0) {
     text += '\n';
   }
 
-  text += `📊 Итого:\n`;
+  text += `📊 Итого: ${Math.round(totalPending+totalReceived)} ₽\n`;
   text += `✅ Поступило: ${Math.round(totalReceived)} ₽\n`;
   text += `⏳ Ожидаем: ${Math.round(totalPending)} ₽`;
 
