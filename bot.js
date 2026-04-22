@@ -1807,7 +1807,8 @@ async function generateBookingsDisplay(departures, arrivals, targetDate, showSta
   } else {
     for (const b of arrivals) {
       const adults = b.extra?.adults || 0;
-      const guestName = `${b.customer?.name || ""} ${b.customer?.surname || ""}`.trim();
+      const guestName = "";
+//      = `${b.customer?.name || ""} ${b.customer?.surname || ""}`.trim();
       text += `• ${b.room_name} ${guestName} (${adults} ${pluralize(adults)})\n\n`;
     }
   }
@@ -1895,7 +1896,7 @@ async function getResidents(targetDateStr) {
     for (const b of residents) {
       const arrivalDate = dateOnly(b.dates?.arrival);
       const adults = b.extra?.adults || 0;
-      const guestName = ""
+      const guestName = "";
 // = `${b.customer?.name || ""} ${b.customer?.surname || ""}`.trim();
 
       // Отметка "заезд сегодня"
