@@ -1894,7 +1894,8 @@ async function getResidents(targetDateStr) {
     for (const b of residents) {
       const arrivalDate = dateOnly(b.dates?.arrival);
       const adults = b.extra?.adults || 0;
-      const guestName = `${b.customer?.name || ""} ${b.customer?.surname || ""}`.trim();
+      const guestName = "";
+//      = `${b.customer?.name || ""} ${b.customer?.surname || ""}`.trim();
 
       // Отметка "заезд сегодня"
       const arrivalTag = arrivalDate === targetDateStr ? " (заезд сегодня)" : "";
