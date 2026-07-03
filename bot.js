@@ -17,6 +17,9 @@ const CLEANING_STATUS_FILE = './cleaning_status.json';
 // Путь к файлу со статусами платежей
 const PAYMENT_STATUS_FILE = './payment_status.json';
 
+// Путь к файлу с бронированиями услуг (баня / лодки)
+const SERVICES_BOOKINGS_FILE = './services_bookings.json';
+
 // ---------- Кэширование данных ----------
 const CACHE_TTL = 10 * 60 * 1000; // 10 минут
 
@@ -193,6 +196,39 @@ async function setPaymentStatus(monthKey, date, status) {
   await savePaymentStatus(statuses);
 }
 
+// ---------- Работа с бронированиями услуг (баня / лодки) ----------
+// Структура файла:
+// {
+//   "sauna": { "2026-07-05": [ {id, start, end, bookedBy} ] },
+//   "boats": { "boat1": { "2026-07-05": [ {id, start, end, type, bookedBy} ] }, "boat2": {...}, "boat3": {...} }
+// }
+async function readServicesBookings() {
+  try {
+    const data = await fs.readFile(SERVICES_BOOKINGS_FILE, 'utf-8');
+    return JSON.parse(data);
+  } catch (error) {
+    return { sauna: {}, boats: {} };
+  }
+}
+
+async function saveServicesBookings(data) {
+  await fs.writeFile(SERVICES_BOOKINGS_FILE, JSON.stringify(data, null, 2), 'utf-8');
+}
+
+// Получить брони бани на дату (отсортированные по времени начала)
+async function getSaunaBookings(dateStr) {
+  const data = await readServicesBookings();
+  const list = data.sauna?.[dateStr] || [];
+  return list.slice().sort((a, b) => timeToMinutes(a.start) - timeToMinutes(b.start));
+}
+
+// Получить брони конкретной лодки на дату (отсортированные по времени начала)
+async function getBoatBookings(boatId, dateStr) {
+  const data = await readServicesBookings();
+  const list = data.boats?.[boatId]?.[dateStr] || [];
+  return list.slice().sort((a, b) => timeToMinutes(a.start) - timeToMinutes(b.start));
+}
+
 // ---------- Настройки PMS ----------
 const PMS_ID = process.env.PMS_ID;
 const PMS_PASSWORD = process.env.PMS_PASSWORD;
@@ -327,6 +363,24 @@ function calculatePaymentDate(channel, checkinDate, checkoutDate) {
   return paymentDate;
 }
 
+// ---------- Конфигурация услуг: баня и лодки ----------
+// Баня: фиксированная продолжительность + обязательный перерыв после каждой брони
+const SAUNA_DURATION_MIN = 180; // 3 часа
+const SAUNA_BREAK_MIN = 15;     // обязательный перерыв после каждой брони
+const SAUNA_SLOT_STEP_MIN = 15; // шаг сетки для выбора времени начала (00/15/30/45)
+
+// Лодки: 3 штуки, у каждой своё независимое расписание
+const BOATS = [
+  { id: 'boat1', name: 'Лодка 1' },
+  { id: 'boat2', name: 'Лодка 2' },
+  { id: 'boat3', name: 'Лодка 3' }
+];
+const BOAT_SLOT_STEP_MIN = 60; // шаг сетки для выбора времени начала почасовой аренды (на каждый час)
+
+// Границы суток для бронирования (00:00–24:00)
+const DAY_START_MIN = 0;
+const DAY_END_MIN = 24 * 60;
+
 // ---------- Вспомогательные функции ----------
 // Склонение слова "человек"
 function pluralize(count) {
@@ -387,6 +441,24 @@ function sortByRoomName(bookings) {
     const nameB = (b.room_name || "").toString();
     return nameA.localeCompare(nameB, 'ru', { numeric: true, sensitivity: 'base' });
   });
+}
+
+// Перевод "ЧЧ:ММ" в минуты от начала суток (поддерживает "24:00" = 1440)
+function timeToMinutes(timeStr) {
+  const [h, m] = timeStr.split(':').map(Number);
+  return h * 60 + m;
+}
+
+// Перевод минут от начала суток обратно в "ЧЧ:ММ"
+function minutesToTime(minutes) {
+  const h = String(Math.floor(minutes / 60)).padStart(2, '0');
+  const m = String(minutes % 60).padStart(2, '0');
+  return `${h}:${m}`;
+}
+
+// Генерация уникального ID брони услуги
+function generateBookingId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
 // Функция отправки сообщения с удалением предыдущего
@@ -797,7 +869,39 @@ async function getWeekStats() {
   return text;
 }
 
-// ---------- Получение кассового расписания ----------
+// ---------- Логика бронирования услуг (баня / лодки) ----------
+// Считает список свободных времён начала (в минутах от 00:00) для брони заданной длительности.
+//
+// existingBookings — брони на этот день: [{ start: "ЧЧ:ММ", end: "ЧЧ:ММ" }]
+// durationMin      — длительность новой брони в минутах
+// breakAfterMin    — обязательный перерыв ПОСЛЕ каждой существующей брони (для бани — 15 мин, для лодок — 0)
+// dayStart/dayEnd  — границы суток в минутах (по умолчанию 00:00–24:00)
+// step             — шаг сетки для перебора кандидатов начала (15 мин для бани, 60 мин для лодок)
+//
+// Логика: новая бронь считается годной, если её интервал [start, start+duration)
+// не пересекается ни с одной существующей бронью и её перерывом [start_i, end_i + break).
+// Жёсткой сетки нет — просто перебираем кандидатов с заданным шагом и оставляем те,
+// что полностью помещаются в свободное окно.
+function computeFreeStarts(existingBookings, durationMin, breakAfterMin = 0, dayStart = DAY_START_MIN, dayEnd = DAY_END_MIN, step = 15) {
+  const busy = existingBookings
+    .map((b) => ({
+      start: timeToMinutes(b.start),
+      end: timeToMinutes(b.end) + breakAfterMin
+    }))
+    .sort((a, b) => a.start - b.start);
+
+  const freeStarts = [];
+
+  for (let t = dayStart; t + durationMin <= dayEnd; t += step) {
+    const candidateEnd = t + durationMin;
+    const overlaps = busy.some((b) => t < b.end && candidateEnd > b.start);
+    if (!overlaps) {
+      freeStarts.push(t);
+    }
+  }
+
+  return freeStarts;
+}
 async function getCashSchedule(monthOffset = 0) {
   console.log(`🌐 Запрос к API: кассовое расписание (месяц ${monthOffset >= 0 ? '+' + monthOffset : monthOffset})`);
   const bearer = await getBearer();
@@ -1056,8 +1160,74 @@ function getCleaningKeyboard() {
   ]);
 }
 
-// Главное меню (бот 1 — только уборка)
+// Универсальный генератор календаря на неделю для услуг (баня / лодки).
+// Бронировать можно на любой день, поэтому недели листаются вперёд без ограничений.
+// dateCallbackPrefix — префикс callback'а при выборе даты, итоговый вид: `${dateCallbackPrefix}:${dateStr}`
+// navCallbackPrefix   — префикс callback'а при листании недель: `${navCallbackPrefix}:${weekOffset}`
+// backCallback        — callback кнопки "Назад"
+function getServiceCalendarKeyboard(weekOffset, dateCallbackPrefix, navCallbackPrefix, backCallback) {
+  const today = new Date();
+  const currentDay = today.getDay();
+  const daysFromMonday = currentDay === 0 ? -6 : 1 - currentDay;
+
+  const monday = new Date(today);
+  monday.setDate(today.getDate() + daysFromMonday);
+  monday.setDate(monday.getDate() + weekOffset * 7);
+
+  const weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+  const buttons = [];
+
+  for (let i = 0; i < 7; i++) {
+    const date = new Date(monday);
+    date.setDate(monday.getDate() + i);
+
+    const dateStr = formatDateISO(date);
+    const displayDate = formatDateDDMM(date);
+    const label = `${weekdays[i]} ${displayDate}`;
+
+    buttons.push([Keyboard.button.callback(label, `${dateCallbackPrefix}:${dateStr}`)]);
+  }
+
+  const navButtons = [];
+  if (weekOffset > 0) {
+    navButtons.push(Keyboard.button.callback("⬅ Предыдущая неделя", `${navCallbackPrefix}:${weekOffset - 1}`));
+  }
+  navButtons.push(Keyboard.button.callback("➡ Следующая неделя", `${navCallbackPrefix}:${weekOffset + 1}`));
+
+  buttons.push(navButtons);
+  buttons.push([Keyboard.button.callback("⬅ Назад", backCallback)]);
+
+  return Keyboard.inlineKeyboard(buttons);
+}
+
+// Строит клавиатуру со свободными временными слотами (по perRow штук в ряд)
+// freeStartsMinutes — массив свободных времён начала в минутах от 00:00
+// callbackBuilder    — функция (label:"ЧЧ:ММ") => callback-строка для кнопки
+// backCallback       — callback кнопки "Назад"
+function buildTimeSlotKeyboard(freeStartsMinutes, callbackBuilder, backCallback, perRow = 4) {
+  const buttons = [];
+  let row = [];
+
+  for (const t of freeStartsMinutes) {
+    const label = minutesToTime(t);
+    row.push(Keyboard.button.callback(label, callbackBuilder(label)));
+    if (row.length === perRow) {
+      buttons.push(row);
+      row = [];
+    }
+  }
+  if (row.length > 0) {
+    buttons.push(row);
+  }
+
+  buttons.push([Keyboard.button.callback("⬅ Назад", backCallback)]);
+
+  return Keyboard.inlineKeyboard(buttons);
+}
+
+// Главное меню (бот 1 — уборка + услуги)
 const mainKeyboard = Keyboard.inlineKeyboard([
+  [Keyboard.button.callback("🛎️ Услуги", "services_menu")],
   [Keyboard.button.callback("Уборка", "cleaning_menu")]
 ]);
 
@@ -1245,6 +1415,400 @@ bot.action("back", async (ctx) => {
   await replyAndDeletePrevious(ctx, "Главное меню:", {
     attachments: [mainKeyboard]
   });
+});
+
+// ==================== УСЛУГИ: БАНЯ И ЛОДКИ ====================
+
+// Меню услуг
+bot.action("services_menu", async (ctx) => {
+  const keyboard = Keyboard.inlineKeyboard([
+    [Keyboard.button.callback("🧖 Баня", "sauna_calendar:0")],
+    [Keyboard.button.callback("🚤 Лодки", "boats_menu")],
+    [Keyboard.button.callback("⬅ Назад", "back")]
+  ]);
+
+  await replyAndDeletePrevious(ctx, "Услуги:\n\nВыберите раздел:", {
+    attachments: [keyboard]
+  });
+});
+
+// ---------- БАНЯ ----------
+
+// Календарь для выбора даты бани
+bot.action(/sauna_calendar:(-?\d+)/, async (ctx) => {
+  const weekOffset = parseInt(ctx.match[1], 10);
+
+  const keyboard = getServiceCalendarKeyboard(weekOffset, "sauna_date", "sauna_calendar", "services_menu");
+
+  await replyAndDeletePrevious(ctx, "🧖 Баня\nПродолжительность: 3 часа (+15 мин перерыв после каждой брони)\n\nВыберите дату:", {
+    attachments: [keyboard]
+  });
+});
+
+// Выбор даты бани → показываем свободные интервалы времени
+bot.action(/sauna_date:(.+)/, async (ctx) => {
+  try {
+    const dateStr = ctx.match[1];
+    const displayDate = formatDateDDMM(new Date(dateStr));
+
+    const bookings = await getSaunaBookings(dateStr);
+    const freeStarts = computeFreeStarts(
+      bookings.map((b) => ({ start: b.start, end: b.end })),
+      SAUNA_DURATION_MIN,
+      SAUNA_BREAK_MIN,
+      DAY_START_MIN,
+      DAY_END_MIN,
+      SAUNA_SLOT_STEP_MIN
+    );
+
+    if (freeStarts.length === 0) {
+      const keyboard = Keyboard.inlineKeyboard([
+        [Keyboard.button.callback("⬅ Назад к календарю", "sauna_calendar:0")]
+      ]);
+      await replyAndDeletePrevious(ctx, `🧖 Баня на ${displayDate}\n\nСвободных интервалов нет ❌`, {
+        attachments: [keyboard]
+      });
+      return;
+    }
+
+    let text = `🧖 Баня на ${displayDate}\nПродолжительность: 3 часа\n\n`;
+
+    if (bookings.length > 0) {
+      text += "Занято:\n";
+      for (const b of bookings) {
+        const breakEndLabel = minutesToTime(timeToMinutes(b.end) + SAUNA_BREAK_MIN);
+        text += `🔴 ${b.start}–${b.end} (перерыв до ${breakEndLabel})\n`;
+      }
+      text += "\n";
+    }
+
+    text += "Выберите время начала:";
+
+    const keyboard = buildTimeSlotKeyboard(
+      freeStarts,
+      (label) => `sauna_time:${dateStr}:${label}`,
+      "sauna_calendar:0"
+    );
+
+    await replyAndDeletePrevious(ctx, text, { attachments: [keyboard] });
+  } catch (error) {
+    console.error("❌ Ошибка в обработчике 'sauna_date':", error.message);
+    await replyAndDeletePrevious(ctx, `❌ Ошибка:\n${error.message}`, {
+      attachments: [Keyboard.inlineKeyboard([
+        [Keyboard.button.callback("⬅ Назад", "services_menu")]
+      ])]
+    });
+  }
+});
+
+// Подтверждение брони бани
+bot.action(/sauna_time:(.+):(\d{2}:\d{2})/, async (ctx) => {
+  try {
+    const dateStr = ctx.match[1];
+    const startLabel = ctx.match[2];
+    const startMin = timeToMinutes(startLabel);
+    const endLabel = minutesToTime(startMin + SAUNA_DURATION_MIN);
+
+    // Повторно проверяем свободность на случай, если кто-то забронировал это же время раньше
+    const bookings = await getSaunaBookings(dateStr);
+    const freeStarts = computeFreeStarts(
+      bookings.map((b) => ({ start: b.start, end: b.end })),
+      SAUNA_DURATION_MIN,
+      SAUNA_BREAK_MIN,
+      DAY_START_MIN,
+      DAY_END_MIN,
+      SAUNA_SLOT_STEP_MIN
+    );
+
+    if (!freeStarts.includes(startMin)) {
+      await replyAndDeletePrevious(ctx, "❌ Это время уже заняли. Выберите другое.", {
+        attachments: [Keyboard.inlineKeyboard([
+          [Keyboard.button.callback("⬅ Назад к выбору времени", `sauna_date:${dateStr}`)]
+        ])]
+      });
+      return;
+    }
+
+    const data = await readServicesBookings();
+    if (!data.sauna) data.sauna = {};
+    if (!data.sauna[dateStr]) data.sauna[dateStr] = [];
+
+    const bookedBy = ctx.user?.user_id || ctx.message?.sender?.user_id || null;
+    data.sauna[dateStr].push({
+      id: generateBookingId(),
+      start: startLabel,
+      end: endLabel,
+      bookedBy
+    });
+
+    await saveServicesBookings(data);
+
+    const displayDate = formatDateDDMM(new Date(dateStr));
+    const keyboard = Keyboard.inlineKeyboard([
+      [Keyboard.button.callback("🧖 Забронировать ещё", "sauna_calendar:0")],
+      [Keyboard.button.callback("⬅ В меню услуг", "services_menu")]
+    ]);
+
+    await replyAndDeletePrevious(ctx, `✅ Баня забронирована!\n\n📅 ${displayDate}\n🕐 ${startLabel}–${endLabel}`, {
+      attachments: [keyboard]
+    });
+  } catch (error) {
+    console.error("❌ Ошибка в обработчике 'sauna_time':", error.message);
+    await replyAndDeletePrevious(ctx, `❌ Ошибка:\n${error.message}`, {
+      attachments: [Keyboard.inlineKeyboard([
+        [Keyboard.button.callback("⬅ Назад", "services_menu")]
+      ])]
+    });
+  }
+});
+
+// ---------- ЛОДКИ ----------
+
+// Меню выбора лодки
+bot.action("boats_menu", async (ctx) => {
+  const keyboard = Keyboard.inlineKeyboard([
+    ...BOATS.map((b) => [Keyboard.button.callback(`🚤 ${b.name}`, `boat_duration_menu:${b.id}`)]),
+    [Keyboard.button.callback("⬅ Назад", "services_menu")]
+  ]);
+
+  await replyAndDeletePrevious(ctx, "🚤 Лодки\n\nВыберите лодку:", {
+    attachments: [keyboard]
+  });
+});
+
+// Выбор длительности аренды лодки
+bot.action(/boat_duration_menu:(.+)/, async (ctx) => {
+  const boatId = ctx.match[1];
+  const boat = BOATS.find((b) => b.id === boatId);
+  if (!boat) {
+    await replyAndDeletePrevious(ctx, "❌ Лодка не найдена.", {
+      attachments: [Keyboard.inlineKeyboard([[Keyboard.button.callback("⬅ Назад", "boats_menu")]])]
+    });
+    return;
+  }
+
+  const keyboard = Keyboard.inlineKeyboard([
+    [Keyboard.button.callback("1 час", `boat_calendar:${boatId}:1:0`)],
+    [Keyboard.button.callback("2 часа", `boat_calendar:${boatId}:2:0`)],
+    [Keyboard.button.callback("3 часа", `boat_calendar:${boatId}:3:0`)],
+    [Keyboard.button.callback("Сутки", `boat_calendar:${boatId}:day:0`)],
+    [Keyboard.button.callback("⬅ Назад", "boats_menu")]
+  ]);
+
+  await replyAndDeletePrevious(ctx, `🚤 ${boat.name}\n\nВыберите длительность аренды:\n(более 4 часов — по цене суток)`, {
+    attachments: [keyboard]
+  });
+});
+
+// Календарь для выбора даты аренды лодки
+bot.action(/boat_calendar:(.+):(1|2|3|day):(-?\d+)/, async (ctx) => {
+  const boatId = ctx.match[1];
+  const duration = ctx.match[2];
+  const weekOffset = parseInt(ctx.match[3], 10);
+
+  const boat = BOATS.find((b) => b.id === boatId);
+  if (!boat) {
+    await replyAndDeletePrevious(ctx, "❌ Лодка не найдена.", {
+      attachments: [Keyboard.inlineKeyboard([[Keyboard.button.callback("⬅ Назад", "boats_menu")]])]
+    });
+    return;
+  }
+
+  const durationLabel = duration === 'day' ? 'сутки' : `${duration} ${duration === '1' ? 'час' : 'часа'}`;
+
+  const keyboard = getServiceCalendarKeyboard(
+    weekOffset,
+    `boat_date:${boatId}:${duration}`,
+    `boat_calendar:${boatId}:${duration}`,
+    `boat_duration_menu:${boatId}`
+  );
+
+  await replyAndDeletePrevious(ctx, `🚤 ${boat.name} (${durationLabel})\n\nВыберите дату:`, {
+    attachments: [keyboard]
+  });
+});
+
+// Выбор даты аренды лодки
+bot.action(/boat_date:(.+):(1|2|3|day):(.+)/, async (ctx) => {
+  try {
+    const boatId = ctx.match[1];
+    const duration = ctx.match[2];
+    const dateStr = ctx.match[3];
+
+    const boat = BOATS.find((b) => b.id === boatId);
+    if (!boat) {
+      await replyAndDeletePrevious(ctx, "❌ Лодка не найдена.", {
+        attachments: [Keyboard.inlineKeyboard([[Keyboard.button.callback("⬅ Назад", "boats_menu")]])]
+      });
+      return;
+    }
+
+    const displayDate = formatDateDDMM(new Date(dateStr));
+    const bookings = await getBoatBookings(boatId, dateStr);
+
+    // ---- Сутки: занимают весь день, доступно только если день полностью свободен ----
+    if (duration === 'day') {
+      if (bookings.length > 0) {
+        const keyboard = Keyboard.inlineKeyboard([
+          [Keyboard.button.callback("⬅ Назад к календарю", `boat_calendar:${boatId}:day:0`)]
+        ]);
+        await replyAndDeletePrevious(ctx, `🚤 ${boat.name} на ${displayDate}\n\nДень уже занят ❌`, {
+          attachments: [keyboard]
+        });
+        return;
+      }
+
+      const data = await readServicesBookings();
+      if (!data.boats) data.boats = {};
+      if (!data.boats[boatId]) data.boats[boatId] = {};
+      if (!data.boats[boatId][dateStr]) data.boats[boatId][dateStr] = [];
+
+      const bookedBy = ctx.user?.user_id || ctx.message?.sender?.user_id || null;
+      data.boats[boatId][dateStr].push({
+        id: generateBookingId(),
+        start: "00:00",
+        end: "24:00",
+        type: "day",
+        bookedBy
+      });
+
+      await saveServicesBookings(data);
+
+      const keyboard = Keyboard.inlineKeyboard([
+        [Keyboard.button.callback("🚤 Забронировать ещё", "boats_menu")],
+        [Keyboard.button.callback("⬅ В меню услуг", "services_menu")]
+      ]);
+
+      await replyAndDeletePrevious(ctx, `✅ Лодка забронирована на сутки!\n\n🚤 ${boat.name}\n📅 ${displayDate}`, {
+        attachments: [keyboard]
+      });
+      return;
+    }
+
+    // ---- Почасовая аренда ----
+    const durationMin = parseInt(duration, 10) * 60;
+    const freeStarts = computeFreeStarts(
+      bookings.map((b) => ({ start: b.start, end: b.end })),
+      durationMin,
+      0,
+      DAY_START_MIN,
+      DAY_END_MIN,
+      BOAT_SLOT_STEP_MIN
+    );
+
+    if (freeStarts.length === 0) {
+      const keyboard = Keyboard.inlineKeyboard([
+        [Keyboard.button.callback("⬅ Назад к календарю", `boat_calendar:${boatId}:${duration}:0`)]
+      ]);
+      await replyAndDeletePrevious(ctx, `🚤 ${boat.name} на ${displayDate}\n\nСвободных интервалов нет ❌`, {
+        attachments: [keyboard]
+      });
+      return;
+    }
+
+    let text = `🚤 ${boat.name} на ${displayDate}\nДлительность: ${duration} ${duration === '1' ? 'час' : 'часа'}\n\n`;
+
+    if (bookings.length > 0) {
+      text += "Занято:\n";
+      for (const b of bookings) {
+        const label = b.type === 'day' ? 'весь день' : `${b.start}–${b.end}`;
+        text += `🔴 ${label}\n`;
+      }
+      text += "\n";
+    }
+
+    text += "Выберите время начала:";
+
+    const keyboard = buildTimeSlotKeyboard(
+      freeStarts,
+      (label) => `boat_time:${boatId}:${duration}:${dateStr}:${label}`,
+      `boat_calendar:${boatId}:${duration}:0`
+    );
+
+    await replyAndDeletePrevious(ctx, text, { attachments: [keyboard] });
+  } catch (error) {
+    console.error("❌ Ошибка в обработчике 'boat_date':", error.message);
+    await replyAndDeletePrevious(ctx, `❌ Ошибка:\n${error.message}`, {
+      attachments: [Keyboard.inlineKeyboard([
+        [Keyboard.button.callback("⬅ Назад", "boats_menu")]
+      ])]
+    });
+  }
+});
+
+// Подтверждение почасовой брони лодки
+bot.action(/boat_time:(.+):(1|2|3):(.+):(\d{2}:\d{2})/, async (ctx) => {
+  try {
+    const boatId = ctx.match[1];
+    const duration = ctx.match[2];
+    const dateStr = ctx.match[3];
+    const startLabel = ctx.match[4];
+
+    const boat = BOATS.find((b) => b.id === boatId);
+    if (!boat) {
+      await replyAndDeletePrevious(ctx, "❌ Лодка не найдена.", {
+        attachments: [Keyboard.inlineKeyboard([[Keyboard.button.callback("⬅ Назад", "boats_menu")]])]
+      });
+      return;
+    }
+
+    const durationMin = parseInt(duration, 10) * 60;
+    const startMin = timeToMinutes(startLabel);
+    const endLabel = minutesToTime(startMin + durationMin);
+
+    // Повторно проверяем свободность на случай гонки
+    const bookings = await getBoatBookings(boatId, dateStr);
+    const freeStarts = computeFreeStarts(
+      bookings.map((b) => ({ start: b.start, end: b.end })),
+      durationMin,
+      0,
+      DAY_START_MIN,
+      DAY_END_MIN,
+      BOAT_SLOT_STEP_MIN
+    );
+
+    if (!freeStarts.includes(startMin)) {
+      await replyAndDeletePrevious(ctx, "❌ Это время уже заняли. Выберите другое.", {
+        attachments: [Keyboard.inlineKeyboard([
+          [Keyboard.button.callback("⬅ Назад к выбору времени", `boat_date:${boatId}:${duration}:${dateStr}`)]
+        ])]
+      });
+      return;
+    }
+
+    const data = await readServicesBookings();
+    if (!data.boats) data.boats = {};
+    if (!data.boats[boatId]) data.boats[boatId] = {};
+    if (!data.boats[boatId][dateStr]) data.boats[boatId][dateStr] = [];
+
+    const bookedBy = ctx.user?.user_id || ctx.message?.sender?.user_id || null;
+    data.boats[boatId][dateStr].push({
+      id: generateBookingId(),
+      start: startLabel,
+      end: endLabel,
+      type: "hours",
+      bookedBy
+    });
+
+    await saveServicesBookings(data);
+
+    const displayDate = formatDateDDMM(new Date(dateStr));
+    const keyboard = Keyboard.inlineKeyboard([
+      [Keyboard.button.callback("🚤 Забронировать ещё", "boats_menu")],
+      [Keyboard.button.callback("⬅ В меню услуг", "services_menu")]
+    ]);
+
+    await replyAndDeletePrevious(ctx, `✅ Лодка забронирована!\n\n🚤 ${boat.name}\n📅 ${displayDate}\n🕐 ${startLabel}–${endLabel}`, {
+      attachments: [keyboard]
+    });
+  } catch (error) {
+    console.error("❌ Ошибка в обработчике 'boat_time':", error.message);
+    await replyAndDeletePrevious(ctx, `❌ Ошибка:\n${error.message}`, {
+      attachments: [Keyboard.inlineKeyboard([
+        [Keyboard.button.callback("⬅ Назад", "boats_menu")]
+      ])]
+    });
+  }
 });
 
 // ==================== БОТ 2: КАССОВОЕ РАСПИСАНИЕ ====================
