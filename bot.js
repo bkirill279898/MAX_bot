@@ -1902,6 +1902,5 @@ botCash.action(/pay:(.+):(.+):(pending|received)/, async (ctx) => {
 });
 
 // ---------- Запуск обоих ботов ----------
-
 bot.start();
 botCash.start();
