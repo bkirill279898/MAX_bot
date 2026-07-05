@@ -2118,6 +2118,7 @@ botCash.action(/^pay:(.+):(.+):(pending|received)$/, async (ctx) => {
       [Keyboard.button.callback("⬅ Назад к выбору месяца", "cash_schedule_menu")]
     ]);
 
+
     await replyAndDeletePrevious(ctx, result.text, {
       attachments: [keyboard]
     }, process.env.BOT_TOKEN2, lastBotMessagesCash);
