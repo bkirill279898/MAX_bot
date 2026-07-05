@@ -11,6 +11,12 @@ const botCash = new Bot(process.env.BOT_TOKEN2);
 const lastBotMessages = new Map();
 const lastBotMessagesCash = new Map();
 
+// Состояние процесса бронирования услуг (баня/лодки), по userId
+// pendingBookings: userId -> черновик брони, ожидающий выбора "кто бронирует" (дом/мотель/БМЖРК)
+// awaitingGuestName: userId -> черновик брони с типом "бмжрк", ожидающий ввода ФИО текстом
+const pendingBookings = new Map();
+const awaitingGuestName = new Map();
+
 // Путь к файлу со статусами уборки
 const CLEANING_STATUS_FILE = './cleaning_status.json';
 
@@ -229,6 +235,38 @@ async function getBoatBookings(boatId, dateStr) {
   return list.slice().sort((a, b) => timeToMinutes(a.start) - timeToMinutes(b.start));
 }
 
+// Формирует текстовую сводку "кто что забронировал" на конкретную дату (баня + все лодки)
+async function buildServicesDayText(dateStr) {
+  const displayDate = formatDateDDMM(new Date(dateStr));
+  let text = `📅 ${displayDate}\n\n`;
+
+  const saunaBookings = await getSaunaBookings(dateStr);
+  text += "🧖 Баня:\n";
+  if (saunaBookings.length === 0) {
+    text += "Свободна весь день\n";
+  } else {
+    for (const b of saunaBookings) {
+      text += `${b.start}–${b.end} | ${formatWhoLabel(b)}\n`;
+    }
+  }
+
+  text += "\n🚤 Лодки:\n";
+  for (const boat of BOATS) {
+    const boatBookings = await getBoatBookings(boat.id, dateStr);
+    if (boatBookings.length === 0) {
+      text += `${boat.name}: свободна весь день\n`;
+    } else {
+      text += `${boat.name}:\n`;
+      for (const b of boatBookings) {
+        const timeLabel = b.type === 'day' ? 'весь день' : `${b.start}–${b.end}`;
+        text += `  ${timeLabel} | ${formatWhoLabel(b)}\n`;
+      }
+    }
+  }
+
+  return text;
+}
+
 // ---------- Настройки PMS ----------
 const PMS_ID = process.env.PMS_ID;
 const PMS_PASSWORD = process.env.PMS_PASSWORD;
@@ -381,6 +419,11 @@ const BOAT_SLOT_STEP_MIN = 60; // шаг сетки для выбора врем
 const DAY_START_MIN = 0;
 const DAY_END_MIN = 24 * 60;
 
+// Кто может бронировать услугу: дома 1-6, мотель 1-7, либо произвольный гость (БМЖРК) с вводом ФИО
+const BOOKER_HOUSES_COUNT = 6;
+const BOOKER_MOTELS_COUNT = 7;
+const BOOKER_CUSTOM_LABEL = "БМЖРК";
+
 // ---------- Вспомогательные функции ----------
 // Склонение слова "человек"
 function pluralize(count) {
@@ -459,6 +502,15 @@ function minutesToTime(minutes) {
 // Генерация уникального ID брони услуги
 function generateBookingId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// Форматирует "кто забронировал" для отображения в тексте: "Дом 3", "Мотель 5" или "БМЖРК — Иванов Иван"
+function formatWhoLabel(booking) {
+  if (!booking.bookerLabel) return "—";
+  if (booking.bookerType === 'bmzhrk' && booking.guestName) {
+    return `${booking.bookerLabel} — ${booking.guestName}`;
+  }
+  return booking.bookerLabel;
 }
 
 // Функция отправки сообщения с удалением предыдущего
@@ -1225,6 +1277,41 @@ function buildTimeSlotKeyboard(freeStartsMinutes, callbackBuilder, backCallback,
   return Keyboard.inlineKeyboard(buttons);
 }
 
+// Клавиатура выбора того, кто бронирует услугу: дома 1-6, мотель 1-7, БМЖРК (свободный гость)
+// callbackPrefix — префикс callback'а, итоговый вид: `${callbackPrefix}:dom:3`, `${callbackPrefix}:motel:5`, `${callbackPrefix}:bmzhrk:0`
+function buildBookerKeyboard(callbackPrefix, backCallback) {
+  const buttons = [];
+
+  let row = [];
+  for (let i = 1; i <= BOOKER_HOUSES_COUNT; i++) {
+    row.push(Keyboard.button.callback(`Дом ${i}`, `${callbackPrefix}:dom:${i}`));
+    if (row.length === 3) {
+      buttons.push(row);
+      row = [];
+    }
+  }
+  if (row.length > 0) {
+    buttons.push(row);
+    row = [];
+  }
+
+  for (let i = 1; i <= BOOKER_MOTELS_COUNT; i++) {
+    row.push(Keyboard.button.callback(`Мотель ${i}`, `${callbackPrefix}:motel:${i}`));
+    if (row.length === 3) {
+      buttons.push(row);
+      row = [];
+    }
+  }
+  if (row.length > 0) {
+    buttons.push(row);
+  }
+
+  buttons.push([Keyboard.button.callback(BOOKER_CUSTOM_LABEL, `${callbackPrefix}:bmzhrk:0`)]);
+  buttons.push([Keyboard.button.callback("⬅ Назад", backCallback)]);
+
+  return Keyboard.inlineKeyboard(buttons);
+}
+
 // Главное меню (бот 1 — уборка + услуги)
 const mainKeyboard = Keyboard.inlineKeyboard([
   [Keyboard.button.callback("🛎️ Услуги", "services_menu")],
@@ -1330,7 +1417,7 @@ bot.action("week_stats", async (ctx) => {
 });
 
 // Календарь - показ недели
-bot.action(/calendar:(-?\d+)/, async (ctx) => {
+bot.action(/^calendar:(-?\d+)$/, async (ctx) => {
   const weekOffset = parseInt(ctx.match[1], 10);
 
   await replyAndDeletePrevious(ctx, "Выберите дату:", {
@@ -1339,7 +1426,7 @@ bot.action(/calendar:(-?\d+)/, async (ctx) => {
 });
 
 // Выбор конкретной даты из календаря
-bot.action(/date:(.+)/, async (ctx) => {
+bot.action(/^date:(.+)$/, async (ctx) => {
   try {
     const dateStr = ctx.match[1];
     const today = formatDateISO(new Date());
@@ -1378,7 +1465,7 @@ bot.action(/date:(.+)/, async (ctx) => {
 });
 
 // Изменение статуса уборки номера
-bot.action(/status:(.+):(.+):(not_started|in_progress|done)/, async (ctx) => {
+bot.action(/^status:(.+):(.+):(not_started|in_progress|done)$/, async (ctx) => {
   const dateStr = ctx.match[1];
   const roomName = ctx.match[2];
   const newStatus = ctx.match[3];
@@ -1421,13 +1508,17 @@ bot.action("back", async (ctx) => {
 
 // Меню услуг
 bot.action("services_menu", async (ctx) => {
+  const todayStr = formatDateISO(new Date());
+  const summary = await buildServicesDayText(todayStr);
+
   const keyboard = Keyboard.inlineKeyboard([
     [Keyboard.button.callback("🧖 Баня", "sauna_calendar:0")],
     [Keyboard.button.callback("🚤 Лодки", "boats_menu")],
+    [Keyboard.button.callback("📅 Кто что забронировал", "services_schedule_calendar:0")],
     [Keyboard.button.callback("⬅ Назад", "back")]
   ]);
 
-  await replyAndDeletePrevious(ctx, "Услуги:\n\nВыберите раздел:", {
+  await replyAndDeletePrevious(ctx, `Услуги — сегодня:\n\n${summary}`, {
     attachments: [keyboard]
   });
 });
@@ -1435,7 +1526,7 @@ bot.action("services_menu", async (ctx) => {
 // ---------- БАНЯ ----------
 
 // Календарь для выбора даты бани
-bot.action(/sauna_calendar:(-?\d+)/, async (ctx) => {
+bot.action(/^sauna_calendar:(-?\d+)$/, async (ctx) => {
   const weekOffset = parseInt(ctx.match[1], 10);
 
   const keyboard = getServiceCalendarKeyboard(weekOffset, "sauna_date", "sauna_calendar", "services_menu");
@@ -1446,7 +1537,7 @@ bot.action(/sauna_calendar:(-?\d+)/, async (ctx) => {
 });
 
 // Выбор даты бани → показываем свободные интервалы времени
-bot.action(/sauna_date:(.+)/, async (ctx) => {
+bot.action(/^sauna_date:(.+)$/, async (ctx) => {
   try {
     const dateStr = ctx.match[1];
     const displayDate = formatDateDDMM(new Date(dateStr));
@@ -1477,7 +1568,8 @@ bot.action(/sauna_date:(.+)/, async (ctx) => {
       text += "Занято:\n";
       for (const b of bookings) {
         const breakEndLabel = minutesToTime(timeToMinutes(b.end) + SAUNA_BREAK_MIN);
-        text += `🔴 ${b.start}–${b.end} (перерыв до ${breakEndLabel})\n`;
+        const who = formatWhoLabel(b);
+        text += `🔴 ${b.start}–${b.end} (перерыв до ${breakEndLabel}) | ${who}\n`;
       }
       text += "\n";
     }
@@ -1501,8 +1593,8 @@ bot.action(/sauna_date:(.+)/, async (ctx) => {
   }
 });
 
-// Подтверждение брони бани
-bot.action(/sauna_time:(.+):(\d{2}:\d{2})/, async (ctx) => {
+// Выбор времени бани → переходим к выбору того, кто бронирует
+bot.action(/^sauna_time:(.+):(\d{2}:\d{2})$/, async (ctx) => {
   try {
     const dateStr = ctx.match[1];
     const startLabel = ctx.match[2];
@@ -1529,27 +1621,21 @@ bot.action(/sauna_time:(.+):(\d{2}:\d{2})/, async (ctx) => {
       return;
     }
 
-    const data = await readServicesBookings();
-    if (!data.sauna) data.sauna = {};
-    if (!data.sauna[dateStr]) data.sauna[dateStr] = [];
-
-    const bookedBy = ctx.user?.user_id || ctx.message?.sender?.user_id || null;
-    data.sauna[dateStr].push({
-      id: generateBookingId(),
-      start: startLabel,
-      end: endLabel,
-      bookedBy
-    });
-
-    await saveServicesBookings(data);
+    // Сохраняем черновик брони и переходим к выбору "кто бронирует"
+    const userId = ctx.user?.user_id || ctx.message?.sender?.user_id;
+    if (userId) {
+      pendingBookings.set(userId, {
+        service: 'sauna',
+        date: dateStr,
+        start: startLabel,
+        end: endLabel
+      });
+    }
 
     const displayDate = formatDateDDMM(new Date(dateStr));
-    const keyboard = Keyboard.inlineKeyboard([
-      [Keyboard.button.callback("🧖 Забронировать ещё", "sauna_calendar:0")],
-      [Keyboard.button.callback("⬅ В меню услуг", "services_menu")]
-    ]);
+    const keyboard = buildBookerKeyboard("booker", `sauna_date:${dateStr}`);
 
-    await replyAndDeletePrevious(ctx, `✅ Баня забронирована!\n\n📅 ${displayDate}\n🕐 ${startLabel}–${endLabel}`, {
+    await replyAndDeletePrevious(ctx, `🧖 Баня\n📅 ${displayDate}\n🕐 ${startLabel}–${endLabel}\n\nКто бронирует?`, {
       attachments: [keyboard]
     });
   } catch (error) {
@@ -1577,7 +1663,7 @@ bot.action("boats_menu", async (ctx) => {
 });
 
 // Выбор длительности аренды лодки
-bot.action(/boat_duration_menu:(.+)/, async (ctx) => {
+bot.action(/^boat_duration_menu:(.+)$/, async (ctx) => {
   const boatId = ctx.match[1];
   const boat = BOATS.find((b) => b.id === boatId);
   if (!boat) {
@@ -1601,7 +1687,7 @@ bot.action(/boat_duration_menu:(.+)/, async (ctx) => {
 });
 
 // Календарь для выбора даты аренды лодки
-bot.action(/boat_calendar:(.+):(1|2|3|day):(-?\d+)/, async (ctx) => {
+bot.action(/^boat_calendar:(.+):(1|2|3|day):(-?\d+)$/, async (ctx) => {
   const boatId = ctx.match[1];
   const duration = ctx.match[2];
   const weekOffset = parseInt(ctx.match[3], 10);
@@ -1629,7 +1715,7 @@ bot.action(/boat_calendar:(.+):(1|2|3|day):(-?\d+)/, async (ctx) => {
 });
 
 // Выбор даты аренды лодки
-bot.action(/boat_date:(.+):(1|2|3|day):(.+)/, async (ctx) => {
+bot.action(/^boat_date:(.+):(1|2|3|day):(.+)$/, async (ctx) => {
   try {
     const boatId = ctx.match[1];
     const duration = ctx.match[2];
@@ -1658,28 +1744,21 @@ bot.action(/boat_date:(.+):(1|2|3|day):(.+)/, async (ctx) => {
         return;
       }
 
-      const data = await readServicesBookings();
-      if (!data.boats) data.boats = {};
-      if (!data.boats[boatId]) data.boats[boatId] = {};
-      if (!data.boats[boatId][dateStr]) data.boats[boatId][dateStr] = [];
+      // Сохраняем черновик и переходим к выбору "кто бронирует"
+      const userId = ctx.user?.user_id || ctx.message?.sender?.user_id;
+      if (userId) {
+        pendingBookings.set(userId, {
+          service: 'boat',
+          boatId,
+          duration: 'day',
+          date: dateStr,
+          start: "00:00",
+          end: "24:00"
+        });
+      }
 
-      const bookedBy = ctx.user?.user_id || ctx.message?.sender?.user_id || null;
-      data.boats[boatId][dateStr].push({
-        id: generateBookingId(),
-        start: "00:00",
-        end: "24:00",
-        type: "day",
-        bookedBy
-      });
-
-      await saveServicesBookings(data);
-
-      const keyboard = Keyboard.inlineKeyboard([
-        [Keyboard.button.callback("🚤 Забронировать ещё", "boats_menu")],
-        [Keyboard.button.callback("⬅ В меню услуг", "services_menu")]
-      ]);
-
-      await replyAndDeletePrevious(ctx, `✅ Лодка забронирована на сутки!\n\n🚤 ${boat.name}\n📅 ${displayDate}`, {
+      const keyboard = buildBookerKeyboard("booker", `boat_calendar:${boatId}:day:0`);
+      await replyAndDeletePrevious(ctx, `🚤 ${boat.name}\n📅 ${displayDate}\n🕐 Сутки\n\nКто бронирует?`, {
         attachments: [keyboard]
       });
       return;
@@ -1712,7 +1791,8 @@ bot.action(/boat_date:(.+):(1|2|3|day):(.+)/, async (ctx) => {
       text += "Занято:\n";
       for (const b of bookings) {
         const label = b.type === 'day' ? 'весь день' : `${b.start}–${b.end}`;
-        text += `🔴 ${label}\n`;
+        const who = formatWhoLabel(b);
+        text += `🔴 ${label} | ${who}\n`;
       }
       text += "\n";
     }
@@ -1736,8 +1816,8 @@ bot.action(/boat_date:(.+):(1|2|3|day):(.+)/, async (ctx) => {
   }
 });
 
-// Подтверждение почасовой брони лодки
-bot.action(/boat_time:(.+):(1|2|3):(.+):(\d{2}:\d{2})/, async (ctx) => {
+// Выбор времени почасовой брони лодки → переходим к выбору того, кто бронирует
+bot.action(/^boat_time:(.+):(1|2|3):(.+):(\d{2}:\d{2})$/, async (ctx) => {
   try {
     const boatId = ctx.match[1];
     const duration = ctx.match[2];
@@ -1776,29 +1856,23 @@ bot.action(/boat_time:(.+):(1|2|3):(.+):(\d{2}:\d{2})/, async (ctx) => {
       return;
     }
 
-    const data = await readServicesBookings();
-    if (!data.boats) data.boats = {};
-    if (!data.boats[boatId]) data.boats[boatId] = {};
-    if (!data.boats[boatId][dateStr]) data.boats[boatId][dateStr] = [];
-
-    const bookedBy = ctx.user?.user_id || ctx.message?.sender?.user_id || null;
-    data.boats[boatId][dateStr].push({
-      id: generateBookingId(),
-      start: startLabel,
-      end: endLabel,
-      type: "hours",
-      bookedBy
-    });
-
-    await saveServicesBookings(data);
+    // Сохраняем черновик брони и переходим к выбору "кто бронирует"
+    const userId = ctx.user?.user_id || ctx.message?.sender?.user_id;
+    if (userId) {
+      pendingBookings.set(userId, {
+        service: 'boat',
+        boatId,
+        duration,
+        date: dateStr,
+        start: startLabel,
+        end: endLabel
+      });
+    }
 
     const displayDate = formatDateDDMM(new Date(dateStr));
-    const keyboard = Keyboard.inlineKeyboard([
-      [Keyboard.button.callback("🚤 Забронировать ещё", "boats_menu")],
-      [Keyboard.button.callback("⬅ В меню услуг", "services_menu")]
-    ]);
+    const keyboard = buildBookerKeyboard("booker", `boat_date:${boatId}:${duration}:${dateStr}`);
 
-    await replyAndDeletePrevious(ctx, `✅ Лодка забронирована!\n\n🚤 ${boat.name}\n📅 ${displayDate}\n🕐 ${startLabel}–${endLabel}`, {
+    await replyAndDeletePrevious(ctx, `🚤 ${boat.name}\n📅 ${displayDate}\n🕐 ${startLabel}–${endLabel}\n\nКто бронирует?`, {
       attachments: [keyboard]
     });
   } catch (error) {
@@ -1807,6 +1881,162 @@ bot.action(/boat_time:(.+):(1|2|3):(.+):(\d{2}:\d{2})/, async (ctx) => {
       attachments: [Keyboard.inlineKeyboard([
         [Keyboard.button.callback("⬅ Назад", "boats_menu")]
       ])]
+    });
+  }
+});
+
+// ---------- ЗАВЕРШЕНИЕ БРОНИРОВАНИЯ: выбор того, кто бронирует ----------
+
+// Сохраняет бронь (баня или лодка) в JSON-файл и показывает подтверждение
+async function finalizeBooking(ctx, draft) {
+  const bookedBy = ctx.user?.user_id || ctx.message?.sender?.user_id || null;
+
+  const record = {
+    id: generateBookingId(),
+    start: draft.start,
+    end: draft.end,
+    bookerType: draft.bookerType,
+    bookerLabel: draft.bookerLabel,
+    guestName: draft.guestName || null,
+    bookedBy,
+    createdAt: new Date().toISOString()
+  };
+
+  const data = await readServicesBookings();
+  const displayDate = formatDateDDMM(new Date(draft.date));
+  const whoLabel = formatWhoLabel(record);
+
+  let confirmText;
+  let keyboard;
+
+  if (draft.service === 'sauna') {
+    if (!data.sauna) data.sauna = {};
+    if (!data.sauna[draft.date]) data.sauna[draft.date] = [];
+    data.sauna[draft.date].push(record);
+
+    confirmText = `✅ Баня забронирована!\n\n📅 ${displayDate}\n🕐 ${draft.start}–${draft.end}\n👤 ${whoLabel}`;
+    keyboard = Keyboard.inlineKeyboard([
+      [Keyboard.button.callback("🧖 Забронировать ещё", "sauna_calendar:0")],
+      [Keyboard.button.callback("⬅ В меню услуг", "services_menu")]
+    ]);
+  } else {
+    record.type = draft.duration === 'day' ? 'day' : 'hours';
+
+    if (!data.boats) data.boats = {};
+    if (!data.boats[draft.boatId]) data.boats[draft.boatId] = {};
+    if (!data.boats[draft.boatId][draft.date]) data.boats[draft.boatId][draft.date] = [];
+    data.boats[draft.boatId][draft.date].push(record);
+
+    const boat = BOATS.find((b) => b.id === draft.boatId);
+    const timeLabel = draft.duration === 'day' ? 'сутки' : `${draft.start}–${draft.end}`;
+
+    confirmText = `✅ Лодка забронирована!\n\n🚤 ${boat ? boat.name : draft.boatId}\n📅 ${displayDate}\n🕐 ${timeLabel}\n👤 ${whoLabel}`;
+    keyboard = Keyboard.inlineKeyboard([
+      [Keyboard.button.callback("🚤 Забронировать ещё", "boats_menu")],
+      [Keyboard.button.callback("⬅ В меню услуг", "services_menu")]
+    ]);
+  }
+
+  await saveServicesBookings(data);
+
+  await replyAndDeletePrevious(ctx, confirmText, { attachments: [keyboard] });
+}
+
+// Выбор того, кто бронирует: дом / мотель — сразу завершает бронь; БМЖРК — запрашивает ФИО
+bot.action(/^booker:(dom|motel|bmzhrk):(\d+)$/, async (ctx) => {
+  try {
+    const userId = ctx.user?.user_id || ctx.message?.sender?.user_id;
+    const pending = userId ? pendingBookings.get(userId) : null;
+
+    if (!pending) {
+      await replyAndDeletePrevious(ctx, "❌ Сессия бронирования устарела. Начните заново.", {
+        attachments: [Keyboard.inlineKeyboard([[Keyboard.button.callback("⬅ В меню услуг", "services_menu")]])]
+      });
+      return;
+    }
+
+    const bookerType = ctx.match[1];
+    const idx = parseInt(ctx.match[2], 10);
+
+    let bookerLabel;
+    if (bookerType === 'dom') bookerLabel = `Дом ${idx}`;
+    else if (bookerType === 'motel') bookerLabel = `Мотель ${idx}`;
+    else bookerLabel = BOOKER_CUSTOM_LABEL;
+
+    if (bookerType === 'bmzhrk') {
+      // Ждём ФИО следующим текстовым сообщением от этого пользователя
+      awaitingGuestName.set(userId, { ...pending, bookerType, bookerLabel });
+      pendingBookings.delete(userId);
+
+      await replyAndDeletePrevious(ctx, `${BOOKER_CUSTOM_LABEL}\n\nВведите ФИО гостя следующим сообщением:`, {
+        attachments: [Keyboard.inlineKeyboard([[Keyboard.button.callback("⬅ Отмена", "services_menu")]])]
+      });
+      return;
+    }
+
+    await finalizeBooking(ctx, { ...pending, bookerType, bookerLabel, guestName: null });
+    pendingBookings.delete(userId);
+  } catch (error) {
+    console.error("❌ Ошибка в обработчике 'booker':", error.message);
+    await replyAndDeletePrevious(ctx, `❌ Ошибка:\n${error.message}`, {
+      attachments: [Keyboard.inlineKeyboard([[Keyboard.button.callback("⬅ В меню услуг", "services_menu")]])]
+    });
+  }
+});
+
+// Приём ФИО текстом для брони типа БМЖРК.
+// ВАЖНО: этот обработчик должен молча пропускать (return без ответа) любые сообщения от
+// пользователей, которые сейчас не находятся в процессе ввода ФИО, чтобы не мешать другим кнопкам/командам.
+bot.on('message', async (ctx) => {
+  try {
+    const userId = ctx.user?.user_id || ctx.message?.sender?.user_id;
+    if (!userId) return;
+
+    const pending = awaitingGuestName.get(userId);
+    if (!pending) return; // Не ждём ФИО от этого пользователя — игнорируем сообщение
+
+    const guestName = (ctx.message?.body?.text || '').trim();
+    if (!guestName) {
+      await ctx.reply("Пожалуйста, отправьте ФИО текстом.");
+      return;
+    }
+
+    awaitingGuestName.delete(userId);
+    await finalizeBooking(ctx, { ...pending, guestName });
+  } catch (error) {
+    console.error("❌ Ошибка в обработчике ввода ФИО:", error.message);
+  }
+});
+
+// ---------- СВОДКА "КТО ЧТО ЗАБРОНИРОВАЛ" ПО ДАТЕ ----------
+
+// Календарь для выбора даты сводки
+bot.action(/^services_schedule_calendar:(-?\d+)$/, async (ctx) => {
+  const weekOffset = parseInt(ctx.match[1], 10);
+
+  const keyboard = getServiceCalendarKeyboard(weekOffset, "services_schedule_date", "services_schedule_calendar", "services_menu");
+
+  await replyAndDeletePrevious(ctx, "📅 Кто что забронировал\n\nВыберите дату:", {
+    attachments: [keyboard]
+  });
+});
+
+// Показ сводки бронирований на выбранную дату
+bot.action(/^services_schedule_date:(.+)$/, async (ctx) => {
+  try {
+    const dateStr = ctx.match[1];
+    const text = await buildServicesDayText(dateStr);
+
+    const keyboard = Keyboard.inlineKeyboard([
+      [Keyboard.button.callback("⬅ Назад к календарю", "services_schedule_calendar:0")],
+      [Keyboard.button.callback("⬅ В меню услуг", "services_menu")]
+    ]);
+
+    await replyAndDeletePrevious(ctx, text, { attachments: [keyboard] });
+  } catch (error) {
+    console.error("❌ Ошибка в обработчике 'services_schedule_date':", error.message);
+    await replyAndDeletePrevious(ctx, `❌ Ошибка:\n${error.message}`, {
+      attachments: [Keyboard.inlineKeyboard([[Keyboard.button.callback("⬅ Назад", "services_menu")]])]
     });
   }
 });
@@ -1839,7 +2069,7 @@ botCash.action("cash_schedule_menu", async (ctx) => {
 });
 
 // Показ расписания за месяц
-botCash.action(/cash_month:(-?\d+)/, async (ctx) => {
+botCash.action(/^cash_month:(-?\d+)$/, async (ctx) => {
   try {
     const monthOffset = parseInt(ctx.match[1], 10);
 
@@ -1865,7 +2095,7 @@ botCash.action(/cash_month:(-?\d+)/, async (ctx) => {
 });
 
 // Изменение статуса платежа
-botCash.action(/pay:(.+):(.+):(pending|received)/, async (ctx) => {
+botCash.action(/^pay:(.+):(.+):(pending|received)$/, async (ctx) => {
   try {
     const monthKey = ctx.match[1];
     const date = ctx.match[2];
@@ -1902,5 +2132,6 @@ botCash.action(/pay:(.+):(.+):(pending|received)/, async (ctx) => {
 });
 
 // ---------- Запуск обоих ботов ----------
+
 bot.start();
 botCash.start();
