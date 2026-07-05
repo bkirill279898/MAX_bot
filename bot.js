@@ -2119,6 +2119,7 @@ botCash.action(/^pay:(.+):(.+):(pending|received)$/, async (ctx) => {
     ]);
 
 
+
     await replyAndDeletePrevious(ctx, result.text, {
       attachments: [keyboard]
     }, process.env.BOT_TOKEN2, lastBotMessagesCash);
