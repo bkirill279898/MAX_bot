@@ -228,11 +228,93 @@ async function getSaunaBookings(dateStr) {
   return list.slice().sort((a, b) => timeToMinutes(a.start) - timeToMinutes(b.start));
 }
 
-// Получить брони конкретной лодки на дату (отсортированные по времени начала)
+// Получить брони конкретной лодки на дату (отсортированные по времени начала), как хранятся "сырыми"
 async function getBoatBookings(boatId, dateStr) {
   const data = await readServicesBookings();
   const list = data.boats?.[boatId]?.[dateStr] || [];
   return list.slice().sort((a, b) => timeToMinutes(a.start) - timeToMinutes(b.start));
+}
+
+// Вычисляет длительность брони лодки в минутах: для "суток" всегда фиксированные 24 часа,
+// для почасовой — разница между end и start
+function getBoatBookingDurationMin(booking) {
+  return booking.type === 'day' ? BOAT_DAY_DURATION_MIN : (timeToMinutes(booking.end) - timeToMinutes(booking.start));
+}
+
+// Собирает брони лодки за соседние дни (D-1, D, D+1) и переводит их в АБСОЛЮТНЫЕ минуты
+// (день * 1440 + минуты), чтобы корректно проверять пересечения интервалов, пересекающих полночь
+// (актуально для аренды "на сутки", которая всегда занимает ровно 24 часа от выбранного старта).
+async function getBoatBookingsForAvailability(boatId, dateStr) {
+  const days = [addDaysToDateStr(dateStr, -1), dateStr, addDaysToDateStr(dateStr, 1)];
+  const all = [];
+
+  for (const d of days) {
+    const bookings = await getBoatBookings(boatId, d);
+    for (const b of bookings) {
+      const durationMin = getBoatBookingDurationMin(b);
+      const absStart = dateToDayIndex(d) * 1440 + timeToMinutes(b.start);
+      all.push({ ...b, storageDate: d, absStart, absEnd: absStart + durationMin });
+    }
+  }
+
+  return all;
+}
+
+// Возвращает брони лодки, которые "касаются" указанной даты D — то есть либо начались в D,
+// либо начались в D-1 днём "на сутки" и своим хвостом заходят в утро дня D.
+// Используется для отображения (не для проверки доступности — там нужен более широкий охват).
+async function getBoatBookingsTouchingDate(boatId, dateStr) {
+  const dayIndex = dateToDayIndex(dateStr);
+  const windowStart = dayIndex * 1440;
+  const windowEnd = windowStart + 1440;
+
+  const prevDate = addDaysToDateStr(dateStr, -1);
+  const candidates = [];
+
+  for (const d of [prevDate, dateStr]) {
+    const bookings = await getBoatBookings(boatId, d);
+    for (const b of bookings) {
+      const durationMin = getBoatBookingDurationMin(b);
+      const absStart = dateToDayIndex(d) * 1440 + timeToMinutes(b.start);
+      const absEnd = absStart + durationMin;
+      if (absStart < windowEnd && absEnd > windowStart) {
+        candidates.push({ ...b, storageDate: d, absStart, absEnd });
+      }
+    }
+  }
+
+  return candidates.sort((a, b) => a.absStart - b.absStart);
+}
+
+// Считает свободные времена начала для лодки на дату D, учитывая брони соседних дней
+// (важно для аренды "на сутки", которая может протянуться в следующий день, и для проверки,
+// не залезает ли новая бронь в хвост чужой суточной брони с предыдущего дня)
+function computeFreeStartsForBoat(existingAbsBookings, dateStr, durationMin, step = BOAT_SLOT_STEP_MIN) {
+  const baseAbs = dateToDayIndex(dateStr) * 1440;
+  const freeStarts = [];
+
+  // "Сутки" (durationMin = 1440) можно начать в любое время дня — бронь всё равно займёт
+  // ровно 24 часа вперёд и уедет в следующий день. Почасовую же аренду нужно уместить в
+  // пределах текущего календарного дня (не пересекая полночь).
+  const isFullDay = durationMin >= DAY_END_MIN;
+  const maxStart = isFullDay ? (DAY_END_MIN - step) : (DAY_END_MIN - durationMin);
+
+  for (let t = 0; t <= maxStart; t += step) {
+    const candStart = baseAbs + t;
+    const candEnd = candStart + durationMin;
+    const overlaps = existingAbsBookings.some((b) => candStart < b.absEnd && candEnd > b.absStart);
+    if (!overlaps) freeStarts.push(t);
+  }
+
+  return freeStarts;
+}
+
+// Форматирует диапазон брони "на сутки" для отображения, например "14:15 05.07 → 14:15 06.07"
+function formatSutkiRange(storageDateStr, startLabel) {
+  const startDisplay = formatDateDDMM(new Date(storageDateStr));
+  const endDateStr = addDaysToDateStr(storageDateStr, 1);
+  const endDisplay = formatDateDDMM(new Date(endDateStr));
+  return `${startLabel} ${startDisplay} → ${startLabel} ${endDisplay}`;
 }
 
 // Формирует текстовую сводку "кто что забронировал" на конкретную дату (баня + все лодки)
@@ -246,19 +328,22 @@ async function buildServicesDayText(dateStr) {
     text += "Свободна весь день\n";
   } else {
     for (const b of saunaBookings) {
-      text += `${b.start}–${b.end} | ${formatWhoLabel(b)}\n`;
+      const label = `${formatTimeForDisplay(b.start)}–${formatTimeForDisplay(b.end)}`;
+      text += `${label} | ${formatWhoLabel(b)}\n`;
     }
   }
 
   text += "\n🚤 Лодки:\n";
   for (const boat of BOATS) {
-    const boatBookings = await getBoatBookings(boat.id, dateStr);
+    const boatBookings = await getBoatBookingsTouchingDate(boat.id, dateStr);
     if (boatBookings.length === 0) {
       text += `${boat.name}: свободна весь день\n`;
     } else {
       text += `${boat.name}:\n`;
       for (const b of boatBookings) {
-        const timeLabel = b.type === 'day' ? 'весь день' : `${b.start}–${b.end}`;
+        const timeLabel = b.type === 'day'
+          ? formatSutkiRange(b.storageDate, b.start)
+          : `${b.start}–${b.end}`;
         text += `  ${timeLabel} | ${formatWhoLabel(b)}\n`;
       }
     }
@@ -407,15 +492,26 @@ const SAUNA_DURATION_MIN = 180; // 3 часа
 const SAUNA_BREAK_MIN = 15;     // обязательный перерыв после каждой брони
 const SAUNA_SLOT_STEP_MIN = 15; // шаг сетки для выбора времени начала (00/15/30/45)
 
+// Баня работает "операционными сутками", а не календарными: сутки идут с 06:00 текущего
+// календарного дня до 06:00 следующего. Поэтому бронь, начавшаяся, скажем, в 23:00 или даже
+// в 02:00–03:00 ночи, всё равно относится к ПРЕДЫДУЩЕМУ календарному дню и показывается на нём.
+// Время внутри суток храним в "расширенной" записи (может быть больше 24:00), например
+// бронь 23:00–02:00 хранится как start:"23:00", end:"26:00" — это позволяет считать
+// пересечения интервалов простой арифметикой, не думая про переход через полночь.
+const SAUNA_DAY_ROLLOVER_MIN = 6 * 60;                      // 06:00 — граница операционных суток
+const SAUNA_DAY_START_MIN = SAUNA_DAY_ROLLOVER_MIN;         // 06:00 текущего дня (360)
+const SAUNA_DAY_END_MIN = SAUNA_DAY_ROLLOVER_MIN + 24 * 60; // 06:00 следующего дня (1800)
+
 // Лодки: 3 штуки, у каждой своё независимое расписание
 const BOATS = [
   { id: 'boat1', name: 'Лодка 1' },
   { id: 'boat2', name: 'Лодка 2' },
   { id: 'boat3', name: 'Лодка 3' }
 ];
-const BOAT_SLOT_STEP_MIN = 60; // шаг сетки для выбора времени начала почасовой аренды (на каждый час)
+const BOAT_SLOT_STEP_MIN = 15; // шаг сетки для выбора времени начала (00/15/30/45)
+const BOAT_DAY_DURATION_MIN = 24 * 60; // "сутки" — ровно 24 часа от выбранного времени начала
 
-// Границы суток для бронирования (00:00–24:00)
+// Границы суток для бронирования (00:00–24:00) — используются для лодок
 const DAY_START_MIN = 0;
 const DAY_END_MIN = 24 * 60;
 
@@ -502,6 +598,32 @@ function minutesToTime(minutes) {
 // Генерация уникального ID брони услуги
 function generateBookingId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// ---------- Утилиты для работы с датами через полночь (нужны для брони лодок на сутки и т.п.) ----------
+// Индекс дня (целое число дней от условной эпохи), используем UTC чтобы избежать сдвигов из-за часового пояса
+function dateToDayIndex(dateStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return Math.round(Date.UTC(y, m - 1, d) / 86400000);
+}
+
+// Прибавляет (или отнимает) дни к дате в формате YYYY-MM-DD, возвращает новую дату в том же формате
+function addDaysToDateStr(dateStr, days) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const utcMs = Date.UTC(y, m - 1, d) + days * 86400000;
+  const dt = new Date(utcMs);
+  const yy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getUTCDate()).padStart(2, '0');
+  return `${yy}-${mm}-${dd}`;
+}
+
+// Переводит время "ЧЧ:ММ" в "нормальный" вид для отображения (оборачивает часы >=24 обратно в 0-23).
+// Используется, когда внутреннее время хранится в "расширенной" записи (например "26:00" = 02:00 следующего дня).
+function formatTimeForDisplay(timeStr) {
+  const totalMin = timeToMinutes(timeStr);
+  const wrapped = ((totalMin % 1440) + 1440) % 1440;
+  return minutesToTime(wrapped);
 }
 
 // Форматирует "кто забронировал" для отображения в тексте: "Дом 3", "Мотель 5" или "БМЖРК — Иванов Иван"
@@ -1256,13 +1378,14 @@ function getServiceCalendarKeyboard(weekOffset, dateCallbackPrefix, navCallbackP
 // freeStartsMinutes — массив свободных времён начала в минутах от 00:00
 // callbackBuilder    — функция (label:"ЧЧ:ММ") => callback-строка для кнопки
 // backCallback       — callback кнопки "Назад"
-function buildTimeSlotKeyboard(freeStartsMinutes, callbackBuilder, backCallback, perRow = 4) {
+function buildTimeSlotKeyboard(freeStartsMinutes, callbackBuilder, backCallback, perRow = 4, displayFormatter = null) {
   const buttons = [];
   let row = [];
 
   for (const t of freeStartsMinutes) {
-    const label = minutesToTime(t);
-    row.push(Keyboard.button.callback(label, callbackBuilder(label)));
+    const rawLabel = minutesToTime(t); // используется в callback — должен однозначно разбираться обратно через timeToMinutes
+    const visibleLabel = displayFormatter ? displayFormatter(rawLabel) : rawLabel; // то, что видит пользователь на кнопке
+    row.push(Keyboard.button.callback(visibleLabel, callbackBuilder(rawLabel)));
     if (row.length === perRow) {
       buttons.push(row);
       row = [];
@@ -1547,8 +1670,8 @@ bot.action(/^sauna_date:(.+)$/, async (ctx) => {
       bookings.map((b) => ({ start: b.start, end: b.end })),
       SAUNA_DURATION_MIN,
       SAUNA_BREAK_MIN,
-      DAY_START_MIN,
-      DAY_END_MIN,
+      SAUNA_DAY_START_MIN,
+      SAUNA_DAY_END_MIN,
       SAUNA_SLOT_STEP_MIN
     );
 
@@ -1562,14 +1685,16 @@ bot.action(/^sauna_date:(.+)$/, async (ctx) => {
       return;
     }
 
-    let text = `🧖 Баня на ${displayDate}\nПродолжительность: 3 часа\n\n`;
+    let text = `🧖 Баня на ${displayDate}\nПродолжительность: 3 часа\n(сутки бани — с 06:00 до 06:00 следующего дня)\n\n`;
 
     if (bookings.length > 0) {
       text += "Занято:\n";
       for (const b of bookings) {
-        const breakEndLabel = minutesToTime(timeToMinutes(b.end) + SAUNA_BREAK_MIN);
+        const breakEndLabel = formatTimeForDisplay(minutesToTime(timeToMinutes(b.end) + SAUNA_BREAK_MIN));
         const who = formatWhoLabel(b);
-        text += `🔴 ${b.start}–${b.end} (перерыв до ${breakEndLabel}) | ${who}\n`;
+        const startDisp = formatTimeForDisplay(b.start);
+        const endDisp = formatTimeForDisplay(b.end);
+        text += `🔴 ${startDisp}–${endDisp} (перерыв до ${breakEndLabel}) | ${who}\n`;
       }
       text += "\n";
     }
@@ -1579,7 +1704,9 @@ bot.action(/^sauna_date:(.+)$/, async (ctx) => {
     const keyboard = buildTimeSlotKeyboard(
       freeStarts,
       (label) => `sauna_time:${dateStr}:${label}`,
-      "sauna_calendar:0"
+      "sauna_calendar:0",
+      4,
+      formatTimeForDisplay
     );
 
     await replyAndDeletePrevious(ctx, text, { attachments: [keyboard] });
@@ -1597,7 +1724,7 @@ bot.action(/^sauna_date:(.+)$/, async (ctx) => {
 bot.action(/^sauna_time:(.+):(\d{2}:\d{2})$/, async (ctx) => {
   try {
     const dateStr = ctx.match[1];
-    const startLabel = ctx.match[2];
+    const startLabel = ctx.match[2]; // "сырое" время в расширенной записи (может быть >24:00)
     const startMin = timeToMinutes(startLabel);
     const endLabel = minutesToTime(startMin + SAUNA_DURATION_MIN);
 
@@ -1607,8 +1734,8 @@ bot.action(/^sauna_time:(.+):(\d{2}:\d{2})$/, async (ctx) => {
       bookings.map((b) => ({ start: b.start, end: b.end })),
       SAUNA_DURATION_MIN,
       SAUNA_BREAK_MIN,
-      DAY_START_MIN,
-      DAY_END_MIN,
+      SAUNA_DAY_START_MIN,
+      SAUNA_DAY_END_MIN,
       SAUNA_SLOT_STEP_MIN
     );
 
@@ -1621,7 +1748,7 @@ bot.action(/^sauna_time:(.+):(\d{2}:\d{2})$/, async (ctx) => {
       return;
     }
 
-    // Сохраняем черновик брони и переходим к выбору "кто бронирует"
+    // Сохраняем черновик брони (в "сырой", расширенной записи) и переходим к выбору "кто бронирует"
     const userId = ctx.user?.user_id || ctx.message?.sender?.user_id;
     if (userId) {
       pendingBookings.set(userId, {
@@ -1633,9 +1760,11 @@ bot.action(/^sauna_time:(.+):(\d{2}:\d{2})$/, async (ctx) => {
     }
 
     const displayDate = formatDateDDMM(new Date(dateStr));
+    const startDisp = formatTimeForDisplay(startLabel);
+    const endDisp = formatTimeForDisplay(endLabel);
     const keyboard = buildBookerKeyboard("booker", `sauna_date:${dateStr}`);
 
-    await replyAndDeletePrevious(ctx, `🧖 Баня\n📅 ${displayDate}\n🕐 ${startLabel}–${endLabel}\n\nКто бронирует?`, {
+    await replyAndDeletePrevious(ctx, `🧖 Баня\n📅 ${displayDate}\n🕐 ${startDisp}–${endDisp}\n\nКто бронирует?`, {
       attachments: [keyboard]
     });
   } catch (error) {
@@ -1714,7 +1843,7 @@ bot.action(/^boat_calendar:(.+):(1|2|3|day):(-?\d+)$/, async (ctx) => {
   });
 });
 
-// Выбор даты аренды лодки
+// Выбор даты аренды лодки → показываем свободные времена начала (и для почасовой, и для суток)
 bot.action(/^boat_date:(.+):(1|2|3|day):(.+)$/, async (ctx) => {
   try {
     const boatId = ctx.match[1];
@@ -1730,50 +1859,11 @@ bot.action(/^boat_date:(.+):(1|2|3|day):(.+)$/, async (ctx) => {
     }
 
     const displayDate = formatDateDDMM(new Date(dateStr));
-    const bookings = await getBoatBookings(boatId, dateStr);
+    const durationMin = duration === 'day' ? BOAT_DAY_DURATION_MIN : parseInt(duration, 10) * 60;
+    const durationLabel = duration === 'day' ? 'сутки' : `${duration} ${duration === '1' ? 'час' : 'часа'}`;
 
-    // ---- Сутки: занимают весь день, доступно только если день полностью свободен ----
-    if (duration === 'day') {
-      if (bookings.length > 0) {
-        const keyboard = Keyboard.inlineKeyboard([
-          [Keyboard.button.callback("⬅ Назад к календарю", `boat_calendar:${boatId}:day:0`)]
-        ]);
-        await replyAndDeletePrevious(ctx, `🚤 ${boat.name} на ${displayDate}\n\nДень уже занят ❌`, {
-          attachments: [keyboard]
-        });
-        return;
-      }
-
-      // Сохраняем черновик и переходим к выбору "кто бронирует"
-      const userId = ctx.user?.user_id || ctx.message?.sender?.user_id;
-      if (userId) {
-        pendingBookings.set(userId, {
-          service: 'boat',
-          boatId,
-          duration: 'day',
-          date: dateStr,
-          start: "00:00",
-          end: "24:00"
-        });
-      }
-
-      const keyboard = buildBookerKeyboard("booker", `boat_calendar:${boatId}:day:0`);
-      await replyAndDeletePrevious(ctx, `🚤 ${boat.name}\n📅 ${displayDate}\n🕐 Сутки\n\nКто бронирует?`, {
-        attachments: [keyboard]
-      });
-      return;
-    }
-
-    // ---- Почасовая аренда ----
-    const durationMin = parseInt(duration, 10) * 60;
-    const freeStarts = computeFreeStarts(
-      bookings.map((b) => ({ start: b.start, end: b.end })),
-      durationMin,
-      0,
-      DAY_START_MIN,
-      DAY_END_MIN,
-      BOAT_SLOT_STEP_MIN
-    );
+    const existingAbs = await getBoatBookingsForAvailability(boatId, dateStr);
+    const freeStarts = computeFreeStartsForBoat(existingAbs, dateStr, durationMin, BOAT_SLOT_STEP_MIN);
 
     if (freeStarts.length === 0) {
       const keyboard = Keyboard.inlineKeyboard([
@@ -1785,14 +1875,22 @@ bot.action(/^boat_date:(.+):(1|2|3|day):(.+)$/, async (ctx) => {
       return;
     }
 
-    let text = `🚤 ${boat.name} на ${displayDate}\nДлительность: ${duration} ${duration === '1' ? 'час' : 'часа'}\n\n`;
+    // Показываем, что уже занято в этот день (включая "хвост" суточной брони с предыдущего дня)
+    const touching = await getBoatBookingsTouchingDate(boatId, dateStr);
 
-    if (bookings.length > 0) {
+    let text = `🚤 ${boat.name} на ${displayDate}\nДлительность: ${durationLabel}\n`;
+    if (duration === 'day') {
+      text += "(сутки — ровно 24 часа от выбранного времени начала)\n";
+    }
+    text += "\n";
+
+    if (touching.length > 0) {
       text += "Занято:\n";
-      for (const b of bookings) {
-        const label = b.type === 'day' ? 'весь день' : `${b.start}–${b.end}`;
-        const who = formatWhoLabel(b);
-        text += `🔴 ${label} | ${who}\n`;
+      for (const b of touching) {
+        const label = b.type === 'day'
+          ? formatSutkiRange(b.storageDate, b.start)
+          : `${b.start}–${b.end}`;
+        text += `🔴 ${label} | ${formatWhoLabel(b)}\n`;
       }
       text += "\n";
     }
@@ -1816,8 +1914,8 @@ bot.action(/^boat_date:(.+):(1|2|3|day):(.+)$/, async (ctx) => {
   }
 });
 
-// Выбор времени почасовой брони лодки → переходим к выбору того, кто бронирует
-bot.action(/^boat_time:(.+):(1|2|3):(.+):(\d{2}:\d{2})$/, async (ctx) => {
+// Выбор времени брони лодки (почасовой или суток) → переходим к выбору того, кто бронирует
+bot.action(/^boat_time:(.+):(1|2|3|day):(.+):(\d{2}:\d{2})$/, async (ctx) => {
   try {
     const boatId = ctx.match[1];
     const duration = ctx.match[2];
@@ -1832,20 +1930,13 @@ bot.action(/^boat_time:(.+):(1|2|3):(.+):(\d{2}:\d{2})$/, async (ctx) => {
       return;
     }
 
-    const durationMin = parseInt(duration, 10) * 60;
+    const durationMin = duration === 'day' ? BOAT_DAY_DURATION_MIN : parseInt(duration, 10) * 60;
     const startMin = timeToMinutes(startLabel);
     const endLabel = minutesToTime(startMin + durationMin);
 
     // Повторно проверяем свободность на случай гонки
-    const bookings = await getBoatBookings(boatId, dateStr);
-    const freeStarts = computeFreeStarts(
-      bookings.map((b) => ({ start: b.start, end: b.end })),
-      durationMin,
-      0,
-      DAY_START_MIN,
-      DAY_END_MIN,
-      BOAT_SLOT_STEP_MIN
-    );
+    const existingAbs = await getBoatBookingsForAvailability(boatId, dateStr);
+    const freeStarts = computeFreeStartsForBoat(existingAbs, dateStr, durationMin, BOAT_SLOT_STEP_MIN);
 
     if (!freeStarts.includes(startMin)) {
       await replyAndDeletePrevious(ctx, "❌ Это время уже заняли. Выберите другое.", {
@@ -1870,9 +1961,10 @@ bot.action(/^boat_time:(.+):(1|2|3):(.+):(\d{2}:\d{2})$/, async (ctx) => {
     }
 
     const displayDate = formatDateDDMM(new Date(dateStr));
+    const timeLabel = duration === 'day' ? formatSutkiRange(dateStr, startLabel) : `${startLabel}–${endLabel}`;
     const keyboard = buildBookerKeyboard("booker", `boat_date:${boatId}:${duration}:${dateStr}`);
 
-    await replyAndDeletePrevious(ctx, `🚤 ${boat.name}\n📅 ${displayDate}\n🕐 ${startLabel}–${endLabel}\n\nКто бронирует?`, {
+    await replyAndDeletePrevious(ctx, `🚤 ${boat.name}\n📅 ${displayDate}\n🕐 ${timeLabel}\n\nКто бронирует?`, {
       attachments: [keyboard]
     });
   } catch (error) {
@@ -1987,7 +2079,7 @@ bot.action(/^booker:(dom|motel|bmzhrk):(\d+)$/, async (ctx) => {
 // Приём ФИО текстом для брони типа БМЖРК.
 // ВАЖНО: этот обработчик должен молча пропускать (return без ответа) любые сообщения от
 // пользователей, которые сейчас не находятся в процессе ввода ФИО, чтобы не мешать другим кнопкам/командам.
-bot.on('message', async (ctx) => {
+bot.on('message_created', async (ctx) => {
   try {
     const userId = ctx.user?.user_id || ctx.message?.sender?.user_id;
     if (!userId) return;
@@ -2117,8 +2209,6 @@ botCash.action(/^pay:(.+):(.+):(pending|received)$/, async (ctx) => {
       ...result.statusButtons,
       [Keyboard.button.callback("⬅ Назад к выбору месяца", "cash_schedule_menu")]
     ]);
-
-
 
     await replyAndDeletePrevious(ctx, result.text, {
       attachments: [keyboard]
