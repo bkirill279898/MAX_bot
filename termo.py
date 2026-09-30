@@ -264,7 +264,6 @@ WantedBy=multi-user.target
     print("Логи:      journalctl -u bnovo-alice -f")
     print("Остановка: systemctl stop bnovo-alice")
 
-
 def main():
     if "--install" in sys.argv:
         install_service()
