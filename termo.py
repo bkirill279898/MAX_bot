@@ -9,7 +9,7 @@ Bnovo -> Яндекс Алиса (умный дом): сценарии по до
 поэтому Алиса не дёргается каждую минуту. Состояние хранится в rooms_state.json.
 
 Запуск:
-    python termo.py            # работает в цикле, раз в минуту
+    python termo.py            # работает в цикле: проверка каждый час, ровно в :00
     python termo.py --once     # одна проверка и выход
     python termo.py --show     # только показать, кто сегодня живёт (Алису не трогает)
     python termo.py --dry      # ничего не запускает, только показывает, что бы сделал
@@ -34,8 +34,9 @@ import requests
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "rooms_state.json"
 
-INTERVAL = 60  # секунд между проверками
+RETRY_SECONDS = 300  # повтор после сбоя (сеть, Bnovo, Яндекс); в штатном режиме проверка раз в час, ровно в :00
 TIMEZONE = "Europe/Moscow"
+CHECKOUT_HOUR = 11  # в день выезда (без заезда) пол выключается с этого часа; время выезда в брони не важно
 
 
 # =====================================================================
@@ -240,21 +241,39 @@ def get_bookings(token: str) -> list:
     return found
 
 
+def booking_occupies(b: dict, now: datetime) -> bool:
+    """Считается ли номер занятым этой бронью прямо сейчас.
+
+    Время выезда/заезда из брони не учитывается, только даты.
+    - день заезда и все дни проживания            -> занято (пол включен)
+    - день выезда: до CHECKOUT_HOUR:00             -> занято
+    - день выезда: с CHECKOUT_HOUR:00, заезда нет  -> свободно (пол выключается)
+    Если в день выезда есть ещё и другая бронь с заездом, она даёт "занято" сама,
+    поэтому при выезде + заезде в один день пол остаётся включен.
+    """
+    if is_cancelled(b):
+        return False
+    arr, dep = booking_date(b, "arrival"), booking_date(b, "departure")
+    if not (arr and dep):
+        return False
+    today = now.date().isoformat()
+    if arr > today or dep < today:
+        return False
+    if dep > today:
+        return True              # заезд <= сегодня < выезд
+    if arr == today:
+        return True              # заезд и выезд в один день
+    return now.hour * 60 + now.minute < CHECKOUT_HOUR * 60  # сегодня выезд
+
+
 def occupied_rooms(bookings: list) -> set:
-    """Множество нормализованных названий домов/номеров, где сегодня кто-то живёт."""
-    today = today_local().isoformat()
-    result = set()
-    for b in bookings:
-        if not isinstance(b, dict) or is_cancelled(b):
-            continue
-        arr, dep = booking_date(b, "arrival"), booking_date(b, "departure")
-        if not (arr and dep):
-            continue
-        # Правило "живут сегодня": заезд <= сегодня <= выезд.
-        # Если в день выезда уже нужно считать номер пустым — замените <= dep на < dep.
-        if arr <= today <= dep:
-            result.add(norm(b.get("room_name")))
-    return result
+    """Множество нормализованных названий домов/номеров, которые сейчас заняты."""
+    now = now_local()
+    return {
+        norm(b.get("room_name"))
+        for b in bookings
+        if isinstance(b, dict) and booking_occupies(b, now)
+    }
 
 
 # ---------------------------------------------------------------- Яндекс
@@ -313,6 +332,7 @@ def check_once():
 
     state = load_state()
     changed = False
+    all_ok = True
 
     for room, sensors in ROOMS.items():
         want = "on" if norm(room) in busy else "off"
@@ -340,10 +360,12 @@ def check_once():
                 room_state[sensor] = want
                 changed = True
             else:
-                print("   не удалось, повторим через минуту")
+                all_ok = False
+                print(f"   не удалось, повторим через {RETRY_SECONDS // 60} мин")
 
     if changed and not DRY:
         save_state(state)
+    return all_ok
 
 
 def show_report():
@@ -364,17 +386,18 @@ def show_report():
         else:
             other.append(b)
 
-    print(f"\nСегодня: {today}")
+    print(f"\nСейчас: {now_local().strftime('%Y-%m-%d %H:%M')}")
     print(f"Получено броней: {len(bookings)} "
-          f"(идут сегодня: {len(active)}, не сегодня: {len(other)}, отменённых: {len(cancelled)})")
+          f"(на сегодня: {len(active)}, не сегодня: {len(other)}, отменённых: {len(cancelled)})")
 
-    print("\n--- Брони, которые идут сегодня ---")
+    print(f"\n--- Брони на сегодня (выезд в {CHECKOUT_HOUR}:00 уже учтён) ---")
     if not active:
         print("нет")
     for b in sorted(active, key=lambda x: str(x.get("room_name"))):
         cust = b.get("customer") or {}
         status = (b.get("status") or {}).get("name", "?")
-        print(f"{str(b.get('room_name')):<16} {booking_date(b, 'arrival')} -> "
+        mark = "живут " if booking_occupies(b, now_local()) else "УЕХАЛИ"
+        print(f"{mark} {str(b.get('room_name')):<16} {booking_date(b, 'arrival')} -> "
               f"{booking_date(b, 'departure')}  {status:<10} {cust.get('surname', '')} {cust.get('name', '')}".rstrip())
 
     busy = occupied_rooms(bookings)
@@ -397,6 +420,12 @@ def show_report():
     if unknown:
         print("\nВНИМАНИЕ: брони на номера, которых нет в ROOMS:", sorted(unknown))
         print("Проверьте, как они называются в Bnovo, и поправьте ROOMS.")
+
+
+def seconds_until_next_hour() -> float:
+    now = now_local()
+    nxt = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    return max(1.0, (nxt - now).total_seconds() + 5)  # +5 сек, чтобы точно попасть в новый час
 
 
 def install_service():
@@ -452,13 +481,16 @@ def main():
 
     while True:
         print("\n=== Проверка:", now_local().strftime("%Y-%m-%d %H:%M:%S"), "===", flush=True)
+        ok = False
         try:
-            check_once()
-        except Exception as e:  # сеть/сервер недоступны — не падаем, попробуем через минуту
+            ok = check_once()
+        except Exception as e:  # сеть/сервер недоступны — не падаем
             print("Ошибка:", repr(e), flush=True)
         if ONCE:
             break
-        time.sleep(INTERVAL)
+        delay = seconds_until_next_hour() if ok else RETRY_SECONDS
+        print(f"Следующая проверка через {int(delay // 60)} мин.", flush=True)
+        time.sleep(delay)
 
 
 if __name__ == "__main__":
