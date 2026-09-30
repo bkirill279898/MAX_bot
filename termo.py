@@ -320,10 +320,77 @@ def fetch_bookings_with_relogin() -> list:
         raise
 
 
+def room_state_at(room_bookings: list, dt: datetime):
+    """(включен_ли_пол, причина) для номера на момент dt."""
+    tdate = dt.date().isoformat()
+    arr_t = dep_t = stay = False
+    for b in room_bookings:
+        arr, dep = booking_date(b, "arrival"), booking_date(b, "departure")
+        if not (arr and dep):
+            continue
+        if arr == tdate:
+            arr_t = True
+        elif dep == tdate and arr < tdate:
+            dep_t = True
+        elif arr < tdate < dep:
+            stay = True
+    on = any(booking_occupies(b, dt) for b in room_bookings)
+    if on:
+        if arr_t and dep_t:
+            reason = "выезд и заезд в один день"
+        elif arr_t:
+            reason = "заезд"
+        elif stay:
+            reason = "проживание"
+        else:
+            reason = f"день выезда, пока до {CHECKOUT_HOUR}:00"
+    else:
+        reason = "выезд, заезда нет" if dep_t else "пусто"
+    return on, reason
+
+
+def floor_report(bookings: list):
+    """Печатает: какой пол включен/выключен сейчас и что будет после CHECKOUT_HOUR:00."""
+    now = now_local()
+    target = now.replace(hour=CHECKOUT_HOUR, minute=0, second=0, microsecond=0)
+    when = "сегодня"
+    if now >= target:  # 11:00 уже прошло — показываем прогноз на следующие 11:00
+        target += timedelta(days=1)
+        when = "завтра"
+
+    by_room = {}
+    for b in bookings:
+        if isinstance(b, dict) and not is_cancelled(b):
+            by_room.setdefault(norm(b.get("room_name")), []).append(b)
+
+    print(f"Пол: сейчас {now:%H:%M} -> после {CHECKOUT_HOUR}:00 ({when})")
+    now_on = later_on = 0
+    turn_off, turn_on = [], []
+    for room in ROOMS:
+        bks = by_room.get(norm(room), [])
+        on_now, _ = room_state_at(bks, now)
+        on_later, reason = room_state_at(bks, target)
+        now_on += on_now
+        later_on += on_later
+        if on_now and not on_later:
+            turn_off.append(room)
+        elif on_later and not on_now:
+            turn_on.append(room)
+        print(f"  {room:<14} сейчас {'ВКЛ ' if on_now else 'ВЫКЛ'}  ->  после {CHECKOUT_HOUR}:00 "
+              f"{'ВКЛ ' if on_later else 'ВЫКЛ'}  ({reason})")
+
+    print(f"Итого: сейчас включено {now_on} из {len(ROOMS)}, после {CHECKOUT_HOUR}:00 ({when}) будет {later_on}")
+    if turn_off:
+        print(f"  Выключатся в {CHECKOUT_HOUR}:00: {', '.join(turn_off)}")
+    if turn_on:
+        print(f"  Включатся: {', '.join(turn_on)}")
+
+
 def check_once():
     bookings = fetch_bookings_with_relogin()
     busy = occupied_rooms(bookings)
     print(f"Броней получено: {len(bookings)}, занято сейчас: {len(busy)}")
+    floor_report(bookings)
 
     known = {norm(r) for r in ROOMS}
     unknown = busy - known
@@ -403,14 +470,14 @@ def show_report():
     busy = occupied_rooms(bookings)
     known = {norm(r) for r in ROOMS}
 
-    print("\n--- По домам и номерам ---")
+    print("\n--- Пол по домам и номерам ---")
+    floor_report(bookings)
+
     by_cat = {}
     for room in ROOMS:
-        is_busy = norm(room) in busy
         cat = room.split(" №")[0]
         by_cat.setdefault(cat, [0, 0])
-        by_cat[cat][0 if is_busy else 1] += 1
-        print(f"{room:<16} {'ЖИВУТ' if is_busy else 'пусто'}")
+        by_cat[cat][0 if norm(room) in busy else 1] += 1
 
     print("\n--- По категориям ---")
     for cat, (b_cnt, e_cnt) in by_cat.items():
