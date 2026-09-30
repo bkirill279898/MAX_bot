@@ -53,7 +53,7 @@ YANDEX_URL = "https://api.iot.yandex.net/v1.0"
 DEBUG = "--debug" in sys.argv
 DRY = "--dry" in sys.argv
 ONCE = "--once" in sys.argv
-INTERVAL = 60  # секунд между проверками
+INTERVAL = 10  # секунд между проверками
 TIMEZONE = "Europe/Moscow"
 
 
