@@ -11,6 +11,7 @@ Bnovo -> Яндекс Алиса (умный дом): сценарии по до
 Запуск:
     python termo.py            # работает в цикле: проверка каждый час, ровно в :00
     python termo.py --once     # одна проверка и выход
+    python termo.py --scenarios # показать список сценариев Алисы (название и ID)
     python termo.py --show     # только показать, кто сегодня живёт (Алису не трогает)
     python termo.py --dry      # ничего не запускает, только показывает, что бы сделал
     python termo.py --debug    # подробный вывод ответов Bnovo
@@ -48,7 +49,7 @@ CHECKOUT_HOUR = 11  # до этого часа пол держится по вы
 # =====================================================================
 ROOMS = {
     "Коттедж №1": {
-        "Датчик 1": {"on": "", "off": ""},
+        "Датчик 1": {"on": "59bf8a18-7435-4652-b536-3ae8722759c2", "off": "59bf8a18-7435-4652-b536-3ae8722759c2"},
         "Датчик 2": {"on": "", "off": ""},
     },
 
@@ -73,8 +74,8 @@ ROOMS = {
     },
 
     "Коттедж №6": {
-        "Датчик 1": {"on": "59bf8a18-7435-4652-b536-3ae8722759c2", "off": "59bf8a18-7435-4652-b536-3ae8722759c2"},
-        "Датчик 2": {"on": "59bf8a18-7435-4652-b536-3ae8722759c2", "off": "59bf8a18-7435-4652-b536-3ae8722759c2"},
+        "Датчик 1": {"on": "", "off": ""},
+        "Датчик 2": {"on": "", "off": ""},
     },
 
     "Мотель №1": {
@@ -497,6 +498,25 @@ def seconds_until_next_hour() -> float:
     return max(1.0, (nxt - now).total_seconds() + 5)  # +5 сек, чтобы точно попасть в новый час
 
 
+def list_scenarios():
+    """Печатает список сценариев Алисы (название и ID), чтобы вписать ID в ROOMS."""
+    if not YANDEX_TOKEN:
+        sys.exit("Не задан YANDEX_TOKEN (см. .env)")
+    r = requests.get(
+        f"{YANDEX_URL}/user/info",
+        headers={"Authorization": f"Bearer {YANDEX_TOKEN}"},
+        timeout=20,
+    )
+    print("Yandex user/info:", r.status_code)
+    if not r.ok:
+        print(r.text[:500])
+        return
+    scenarios = r.json().get("scenarios") or []
+    print(f"Сценариев: {len(scenarios)}\n")
+    for sc in sorted(scenarios, key=lambda x: str(x.get("name", ""))):
+        print(f"{sc.get('id')}   {sc.get('name')}")
+
+
 def install_service():
     """Ставит программу как systemd-службу: автозапуск и перезапуск при сбоях."""
     if os.geteuid() != 0:
@@ -530,6 +550,10 @@ def main():
         install_service()
         return
 
+    if "--scenarios" in sys.argv:
+        list_scenarios()
+        return
+
     missing = [n for n, v in {
         "BNOVO_ID": BNOVO_ID, "BNOVO_PASSWORD": BNOVO_PASSWORD,
         "YANDEX_TOKEN": YANDEX_TOKEN,
@@ -558,7 +582,7 @@ def main():
         if ONCE:
             break
         delay = seconds_until_next_hour() if ok else RETRY_SECONDS
-        print(f"Следующая проверка через {int(delay // 60)} мин.", flush=True)
+        print(f"Следующая проверка через {int(delay // 1)} мин.", flush=True)
         time.sleep(delay)
 
 
