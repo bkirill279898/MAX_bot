@@ -582,7 +582,7 @@ def main():
         if ONCE:
             break
         delay = seconds_until_next_hour() if ok else RETRY_SECONDS
-        print(f"Следующая проверка через {int(delay // 1)} мин.", flush=True)
+        print(f"Следующая проверка через {int(delay // 600)} мин.", flush=True)
         time.sleep(delay)
 
 

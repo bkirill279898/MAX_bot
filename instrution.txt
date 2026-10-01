@@ -12,9 +12,9 @@ journalctl -u bnovo-alice -n 60 --no-pager # статусы
 systemctl stop bnovo-alice
 rm -f rooms_state.json
 ./venv/bin/python termo.py --once --dry
-Теперь в выводе должны появиться строки
-Коттедж №6 / Датчик 1: ВКЛ и [dry] сценарий был бы запущен.
-Если всё выглядит правильно:
+    #Теперь в выводе должны появиться строки
+    #Коттедж №6 / Датчик 1: ВКЛ и [dry] сценарий был бы запущен.
+    #Если всё выглядит правильно:
 ./venv/bin/python termo.py --once
 systemctl start bnovo-alice
 -----------------------------------------------------------
