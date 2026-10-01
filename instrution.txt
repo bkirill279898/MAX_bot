@@ -5,4 +5,4 @@ systemctl start bnovo-alice                # запустить
 systemctl restart bnovo-alice              # перезапустить (после правки termo.py или .env)
 systemctl disable --now bnovo-alice        # остановить и убрать из автозапуска
 ./venv/bin/python termo.py --show          # показать брони
-journalctl -u bnovo-alice -n 20 --no-pager # статусы
+journalctl -u bnovo-alice -n 60 --no-pager # статусы
