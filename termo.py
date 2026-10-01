@@ -36,7 +36,7 @@ STATE_FILE = BASE_DIR / "rooms_state.json"
 
 RETRY_SECONDS = 300  # повтор после сбоя (сеть, Bnovo, Яндекс); в штатном режиме проверка раз в час, ровно в :00
 TIMEZONE = "Europe/Moscow"
-CHECKOUT_HOUR = 11  # в день выезда (без заезда) пол выключается с этого часа; время выезда в брони не важно
+CHECKOUT_HOUR = 11  # до этого часа пол держится по выезжающему, с этого часа — по заезжающему; время в брони не важно
 
 
 # =====================================================================
@@ -241,39 +241,14 @@ def get_bookings(token: str) -> list:
     return found
 
 
-def booking_occupies(b: dict, now: datetime) -> bool:
-    """Считается ли номер занятым этой бронью прямо сейчас.
-
-    Время выезда/заезда из брони не учитывается, только даты.
-    - день заезда и все дни проживания            -> занято (пол включен)
-    - день выезда: до CHECKOUT_HOUR:00             -> занято
-    - день выезда: с CHECKOUT_HOUR:00, заезда нет  -> свободно (пол выключается)
-    Если в день выезда есть ещё и другая бронь с заездом, она даёт "занято" сама,
-    поэтому при выезде + заезде в один день пол остаётся включен.
-    """
-    if is_cancelled(b):
-        return False
-    arr, dep = booking_date(b, "arrival"), booking_date(b, "departure")
-    if not (arr and dep):
-        return False
-    today = now.date().isoformat()
-    if arr > today or dep < today:
-        return False
-    if dep > today:
-        return True              # заезд <= сегодня < выезд
-    if arr == today:
-        return True              # заезд и выезд в один день
-    return now.hour * 60 + now.minute < CHECKOUT_HOUR * 60  # сегодня выезд
-
-
 def occupied_rooms(bookings: list) -> set:
-    """Множество нормализованных названий домов/номеров, которые сейчас заняты."""
+    """Множество нормализованных названий домов/номеров, где пол должен быть включен сейчас."""
     now = now_local()
-    return {
-        norm(b.get("room_name"))
-        for b in bookings
-        if isinstance(b, dict) and booking_occupies(b, now)
-    }
+    by_room = {}
+    for b in bookings:
+        if isinstance(b, dict) and not is_cancelled(b):
+            by_room.setdefault(norm(b.get("room_name")), []).append(b)
+    return {room for room, bks in by_room.items() if room_state_at(bks, now)[0]}
 
 
 # ---------------------------------------------------------------- Яндекс
@@ -321,10 +296,19 @@ def fetch_bookings_with_relogin() -> list:
 
 
 def room_state_at(room_bookings: list, dt: datetime):
-    """(включен_ли_пол, причина) для номера на момент dt."""
+    """(включен_ли_пол, причина) для номера на момент dt. Учитываются только даты броней.
+
+    Правила (H = CHECKOUT_HOUR):
+    - гость проживает (заезд раньше, выезд позже сегодняшнего дня) -> ВКЛ
+    - до H:00: ВКЛ, только если сегодня выезд (гость ещё в номере); заезд сегодня сам по себе не включает
+    - с H:00:  ВКЛ, только если сегодня заезд; выезд без заезда -> ВЫКЛ
+    - выезд и заезд в один день -> ВКЛ весь день
+    """
     tdate = dt.date().isoformat()
     arr_t = dep_t = stay = False
     for b in room_bookings:
+        if is_cancelled(b):
+            continue
         arr, dep = booking_date(b, "arrival"), booking_date(b, "departure")
         if not (arr and dep):
             continue
@@ -334,56 +318,68 @@ def room_state_at(room_bookings: list, dt: datetime):
             dep_t = True
         elif arr < tdate < dep:
             stay = True
-    on = any(booking_occupies(b, dt) for b in room_bookings)
-    if on:
-        if arr_t and dep_t:
-            reason = "выезд и заезд в один день"
-        elif arr_t:
-            reason = "заезд"
-        elif stay:
-            reason = "проживание"
-        else:
-            reason = f"день выезда, пока до {CHECKOUT_HOUR}:00"
-    else:
-        reason = "выезд, заезда нет" if dep_t else "пусто"
-    return on, reason
+
+    before = dt.hour * 60 + dt.minute < CHECKOUT_HOUR * 60
+    h = f"{CHECKOUT_HOUR}:00"
+
+    if stay:
+        return True, "проживание"
+    if before:
+        if dep_t and arr_t:
+            return True, f"выезд и заезд в один день (гость ещё в номере до {h})"
+        if dep_t:
+            return True, f"день выезда, гость в номере до {h}"
+        if arr_t:
+            return False, f"заезд сегодня, включится в {h}"
+        return False, "пусто"
+    if arr_t and dep_t:
+        return True, "выезд и заезд в один день"
+    if arr_t:
+        return True, "заезд"
+    if dep_t:
+        return False, "выезд, заезда нет"
+    return False, "пусто"
 
 
 def floor_report(bookings: list):
-    """Печатает: какой пол включен/выключен сейчас и что будет после CHECKOUT_HOUR:00."""
+    """Печатает план пола на СЕГОДНЯ: до H:00, после H:00 и состояние сейчас."""
     now = now_local()
-    target = now.replace(hour=CHECKOUT_HOUR, minute=0, second=0, microsecond=0)
-    when = "сегодня"
-    if now >= target:  # 11:00 уже прошло — показываем прогноз на следующие 11:00
-        target += timedelta(days=1)
-        when = "завтра"
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)                      # начало дня (до H:00)
+    cut = now.replace(hour=CHECKOUT_HOUR, minute=0, second=0, microsecond=0)            # H:00
+    passed = now >= cut
 
     by_room = {}
     for b in bookings:
         if isinstance(b, dict) and not is_cancelled(b):
             by_room.setdefault(norm(b.get("room_name")), []).append(b)
 
-    print(f"Пол: сейчас {now:%H:%M} -> после {CHECKOUT_HOUR}:00 ({when})")
-    now_on = later_on = 0
+    def txt(on):
+        return "ВКЛ " if on else "ВЫКЛ"
+
+    print(f"Пол на сегодня ({now:%Y-%m-%d}), сейчас {now:%H:%M}")
+    cnt_now = cnt_before = cnt_after = 0
     turn_off, turn_on = [], []
     for room in ROOMS:
         bks = by_room.get(norm(room), [])
+        on_before, _ = room_state_at(bks, start)
+        on_after, reason = room_state_at(bks, cut)
         on_now, _ = room_state_at(bks, now)
-        on_later, reason = room_state_at(bks, target)
-        now_on += on_now
-        later_on += on_later
-        if on_now and not on_later:
+        cnt_now += on_now
+        cnt_before += on_before
+        cnt_after += on_after
+        if on_before and not on_after:
             turn_off.append(room)
-        elif on_later and not on_now:
+        elif on_after and not on_before:
             turn_on.append(room)
-        print(f"  {room:<14} сейчас {'ВКЛ ' if on_now else 'ВЫКЛ'}  ->  после {CHECKOUT_HOUR}:00 "
-              f"{'ВКЛ ' if on_later else 'ВЫКЛ'}  ({reason})")
+        print(f"  {room:<14} до {CHECKOUT_HOUR}:00 {txt(on_before)} -> после {CHECKOUT_HOUR}:00 {txt(on_after)}"
+              f"   СЕЙЧАС: {txt(on_now)}  ({reason})")
 
-    print(f"Итого: сейчас включено {now_on} из {len(ROOMS)}, после {CHECKOUT_HOUR}:00 ({when}) будет {later_on}")
+    print(f"Итого включено: до {CHECKOUT_HOUR}:00 — {cnt_before}, после {CHECKOUT_HOUR}:00 — {cnt_after}, "
+          f"сейчас — {cnt_now} из {len(ROOMS)}")
     if turn_off:
-        print(f"  Выключатся в {CHECKOUT_HOUR}:00: {', '.join(turn_off)}")
+        print(f"  {'Выключились' if passed else 'Выключатся'} в {CHECKOUT_HOUR}:00: {', '.join(turn_off)}")
     if turn_on:
-        print(f"  Включатся: {', '.join(turn_on)}")
+        print(f"  {'Включились' if passed else 'Включатся'} в {CHECKOUT_HOUR}:00: {', '.join(turn_on)}")
 
 
 def check_once():
@@ -457,13 +453,19 @@ def show_report():
     print(f"Получено броней: {len(bookings)} "
           f"(на сегодня: {len(active)}, не сегодня: {len(other)}, отменённых: {len(cancelled)})")
 
-    print(f"\n--- Брони на сегодня (выезд в {CHECKOUT_HOUR}:00 уже учтён) ---")
+    print(f"\n--- Брони на сегодня (учтено правило {CHECKOUT_HOUR}:00) ---")
     if not active:
         print("нет")
     for b in sorted(active, key=lambda x: str(x.get("room_name"))):
         cust = b.get("customer") or {}
         status = (b.get("status") or {}).get("name", "?")
-        mark = "живут " if booking_occupies(b, now_local()) else "УЕХАЛИ"
+        on_b, _ = room_state_at([b], now_local())
+        if on_b:
+            mark = "живут "
+        elif booking_date(b, "arrival") == today:
+            mark = "заедут "
+        else:
+            mark = "УЕХАЛИ "
         print(f"{mark} {str(b.get('room_name')):<16} {booking_date(b, 'arrival')} -> "
               f"{booking_date(b, 'departure')}  {status:<10} {cust.get('surname', '')} {cust.get('name', '')}".rstrip())
 

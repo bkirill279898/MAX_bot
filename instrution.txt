@@ -1,7 +1,8 @@
-systemctl status bnovo-alice --no-pager   # работает ли
-journalctl -u bnovo-alice -f              # смотреть логи в реальном времени (выход: Ctrl+C)
-systemctl stop bnovo-alice                # остановить
-systemctl start bnovo-alice               # запустить
-systemctl restart bnovo-alice             # перезапустить (после правки termo.py или .env)
-systemctl disable --now bnovo-alice       # остановить и убрать из автозапуска
-./venv/bin/python termo.py --show         # показать брони
+systemctl status bnovo-alice --no-pager    # работает ли
+journalctl -u bnovo-alice -f               # смотреть логи в реальном времени (выход: Ctrl+C)
+systemctl stop bnovo-alice                 # остановить
+systemctl start bnovo-alice                # запустить
+systemctl restart bnovo-alice              # перезапустить (после правки termo.py или .env)
+systemctl disable --now bnovo-alice        # остановить и убрать из автозапуска
+./venv/bin/python termo.py --show          # показать брони
+journalctl -u bnovo-alice -n 20 --no-pager # статусы
