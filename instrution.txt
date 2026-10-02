@@ -1,3 +1,4 @@
+xX&4aw2ubfhk
 systemctl status bnovo-alice --no-pager    # работает ли
 journalctl -u bnovo-alice -f               # смотреть логи в реальном времени (выход: Ctrl+C)
 systemctl stop bnovo-alice                 # остановить

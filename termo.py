@@ -5,8 +5,8 @@ Bnovo -> Яндекс Алиса (умный дом): сценарии по до
 Логика: для каждого дома/номера смотрим в Bnovo, живёт ли там кто-то сегодня.
   - живут  -> для каждого датчика запускается сценарий "on"  (вкл)
   - пусто  -> для каждого датчика запускается сценарий "off" (выкл)
-Сценарий запускается только когда состояние изменилось (или при первом запуске),
-поэтому Алиса не дёргается каждую минуту. Состояние хранится в rooms_state.json.
+Сценарии отправляются при КАЖДОЙ проверке (раз в час) для всех датчиков — даже если
+состояние не менялось, чтобы устройства, которые были не в сети, получили команду.
 
 Запуск:
     python termo.py            # работает в цикле: проверка каждый час, ровно в :00
@@ -394,26 +394,19 @@ def check_once():
     if unknown:
         print("В Bnovo есть брони на номера, которых нет в ROOMS:", sorted(unknown))
 
-    state = load_state()
-    changed = False
+    # Каждую проверку отправляем сценарии заново для ВСЕХ датчиков (а не только при смене
+    # состояния): если устройство было не в сети, оно получит команду при следующей проверке.
+    sent = failed = 0
     all_ok = True
 
     for room, sensors in ROOMS.items():
         want = "on" if norm(room) in busy else "off"
-        room_state = state.setdefault(room, {})
+        label = "ВКЛ" if want == "on" else "ВЫКЛ"
 
         for sensor, scenarios in sensors.items():
-            if room_state.get(sensor) == want:
-                continue  # уже в нужном состоянии
-
             scenario_id = (scenarios.get(want) or "").strip()
-            label = "ВКЛ" if want == "on" else "ВЫКЛ"
-
             if not scenario_id:
-                # сценарий не привязан — считаем выполненным, чтобы не шуметь каждую минуту
-                room_state[sensor] = want
-                changed = True
-                continue
+                continue  # сценарий не привязан
 
             print(f"{room} / {sensor}: {label}")
             if DRY:
@@ -421,14 +414,15 @@ def check_once():
                 continue
 
             if run_yandex_scenario(scenario_id):
-                room_state[sensor] = want
-                changed = True
+                sent += 1
             else:
+                failed += 1
                 all_ok = False
-                print(f"   не удалось, повторим через {RETRY_SECONDS // 60} мин")
 
-    if changed and not DRY:
-        save_state(state)
+    if not DRY:
+        print(f"Сценариев отправлено: {sent}, ошибок: {failed}")
+        if failed:
+            print(f"Есть ошибки, повторим через {RETRY_SECONDS // 60} мин")
     return all_ok
 
 
@@ -494,7 +488,7 @@ def show_report():
 
 def seconds_until_next_hour() -> float:
     now = now_local()
-    nxt = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    nxt = now.replace(minute=0, second=20, microsecond=0) + timedelta(hours=0)
     return max(1.0, (nxt - now).total_seconds() + 5)  # +5 сек, чтобы точно попасть в новый час
 
 
@@ -582,7 +576,7 @@ def main():
         if ONCE:
             break
         delay = seconds_until_next_hour() if ok else RETRY_SECONDS
-        print(f"Следующая проверка через {int(delay // 600)} мин.", flush=True)
+        print(f"Следующая проверка через {int(delay // 60)} мин.", flush=True)
         time.sleep(delay)
 
 
