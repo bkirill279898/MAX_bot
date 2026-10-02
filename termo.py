@@ -488,7 +488,7 @@ def show_report():
 
 def seconds_until_next_hour() -> float:
     now = now_local()
-    nxt = now.replace(minute=0, second=20, microsecond=0) + timedelta(hours=0)
+    nxt = now.replace(minute=0, second=19, microsecond=0) + timedelta(hours=0)
     return max(1.0, (nxt - now).total_seconds() + 5)  # +5 сек, чтобы точно попасть в новый час
 
 
